@@ -9,12 +9,21 @@ Started: 2026-05-29 22:30 (user retired for the night with full autonomy)
 | 2a | Drop pocket axis from `v2/schema.py` | pending |
 | 2b | Drop PDBBind synthesizer from `v2/build_graph.py` | pending |
 | 2c | Delete `run_pdbbind.py` + `load_pdbbind.py` | pending |
-| 2d | Rewrite `run_overnight.task_6_mvp2_graph` to read per-corpus parquets directly (mvp1_plus_pdbbind producer is gone) | pending |
-| 3a | Write `load_bigbind.py` (parses BigBind activities + structures CSVs) | pending |
-| 3b | Add `task_X_bigbind_load` + wire into task_6 | pending |
-| 3c | Emit explicit `ligand_exact` cross-corpus InChIKey edges (fill the gap) | pending |
-| 4 | Extract BigBind tarball on VUW | pending |
-| 5 | Rebuild mvp2 + v2 KG, verify | pending |
+| 2d | Replace `run_overnight.py` with clean `build_kg.py` (KG-only, mvp2→kg rename, audit tasks stripped) | done |
+| 3a | Write `load_bigbind.py` (parses BigBind activities + structures CSVs) | done |
+| 3b | `build_kg.task_load_bigbind` wired in pipeline; `task_build_kg` rewrites the merge | done |
+| 3c | Emit explicit `ligand_exact` cross-corpus InChIKey edges (fill the gap) | done (`cross_src` loop in task_build_kg) |
+| 4 | Extract BigBind tarball on VUW (optional — KG only needs metadata CSVs) | pending |
+| 5 | Clean old outputs on VUW, rebuild KG, verify | pending |
+
+## Phase 2d + 3a notes
+
+- Renamed `run_overnight.py` → `build_kg.py`. Audit tasks (7, 8, 12, 13, 14, 15) and `task_0_state` deleted entirely. Tasks 10 (BayesBind) and 11 (BigBind metadata stub) replaced by proper `task_load_bigbind` calling new `load_bigbind.build()`.
+- `task_build_kg` (was `task_6_mvp2_graph`) no longer reads any `mvp1_*` parquet. It concatenates per-corpus `_nodes/_edges` parquets for litpcba_ave, dude, dekois, bigbind, then layers ChEMBL/BindingDB cross-refs.
+- Cross-corpus `same_inchikey_as` edges: previously only emitted by `run_pdbbind.py` (174 total). Now generalised in `task_build_kg`: scan all 4 corpora's `(smi, inchikey)` pairs and emit edges between distinct lig_node_ids that share an InChIKey. Fills the v2 `ligand_exact` gap that was 0 emissions before.
+- `load_bigbind.build()` returns `(examples_df, nodes_df, edges_df)` using the shared `vsleakkg.build_graph.build_examples_frame + make_nodes_edges` pipeline so BigBind nodes drop straight into the same dedup namespace (`lig:md5(canonical_smiles)`).
+- `v2/build_graph.py` now reads `kg_nodes/kg_edges.parquet` instead of `mvp2_*`.
+- BigBind PDBBind-style cluster anchor: v3 inherits the `pdbbind_protein_clusters_*.parquet` (pre-built MMseqs2 outputs). After dropping PDBBind from KG these clusters dangle until we rebuild clustering across all benchmark proteins. Flagged as Phase 6 TODO.
 
 ## Key findings before execution
 

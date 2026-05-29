@@ -335,8 +335,8 @@ def build_graph(
     require_data_root()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    nodes_name = "mvp2_nodes" if corpus == "all" else f"{corpus}_nodes"
-    edges_name = "mvp2_edges" if corpus == "all" else f"{corpus}_edges"
+    nodes_name = "kg_nodes" if corpus == "all" else f"{corpus}_nodes"
+    edges_name = "kg_edges" if corpus == "all" else f"{corpus}_edges"
 
     nodes_path = processed / f"{nodes_name}.parquet"
     edges_path = processed / f"{edges_name}.parquet"
