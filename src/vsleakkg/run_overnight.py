@@ -33,7 +33,7 @@ from vsleakkg import load_chembl_db, load_bayesbind
 
 
 # -------- paths --------
-ROOT      = Path("D:/hoangpc/VS-LeakKG")
+ROOT      = Path(__file__).resolve().parents[2]
 RAW       = ROOT / "data" / "raw"
 PROCESSED = ROOT / "data" / "processed"
 TABLES    = ROOT / "outputs" / "tables"

@@ -29,7 +29,7 @@ from vsleakkg import chem as vc
 from vsleakkg import build_graph as vb
 from vsleakkg import load_pdbbind
 
-PROJECT_ROOT = Path("D:/hoangpc/VS-LeakKG")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RAW          = PROJECT_ROOT / "data" / "raw" / "PBDBind"
 EXTRACTED    = RAW / "extracted"
 PL_ROOT      = EXTRACTED / "P-L"
