@@ -636,7 +636,18 @@ def task_build_kg() -> str:
     n_df = pl.DataFrame(nodes_new, schema=["node_id", "node_type", "label", "props"], orient="row")
     e_df = pl.DataFrame(edges_new, schema=["src", "dst", "edge_type", "props"], orient="row")
     nodes = pl.concat([base_n, n_df], how="vertical_relaxed").unique(subset=["node_id"])
+    # Defensive: drop any node row whose id or type is empty/null. The merge
+    # of the ChEMBL provenance loop into n_df occasionally emits a handful of
+    # rows with blanked id/type (root cause not yet diagnosed); filtering them
+    # here keeps downstream consumers (v2/build_graph, audits) clean. Edges
+    # referencing the dropped node IDs are also pruned.
+    nodes = nodes.filter(
+        pl.col("node_id").is_not_null() & (pl.col("node_id") != "") &
+        pl.col("node_type").is_not_null() & (pl.col("node_type") != "")
+    )
     edges = pl.concat([base_e, e_df], how="vertical_relaxed").unique()
+    _kept_ids = set(nodes["node_id"].to_list())
+    edges = edges.filter(pl.col("src").is_in(list(_kept_ids)) & pl.col("dst").is_in(list(_kept_ids)))
     nodes.write_parquet(PROCESSED / "kg_nodes.parquet")
     edges.write_parquet(PROCESSED / "kg_edges.parquet")
 
