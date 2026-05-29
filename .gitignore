@@ -80,3 +80,4 @@ env/
 
 # ----- editor / agent local state -----
 .claude/
+.tmp/

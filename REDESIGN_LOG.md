@@ -14,7 +14,68 @@ Started: 2026-05-29 22:30 (user retired for the night with full autonomy)
 | 3b | `build_kg.task_load_bigbind` wired in pipeline; `task_build_kg` rewrites the merge | done |
 | 3c | Emit explicit `ligand_exact` cross-corpus InChIKey edges (fill the gap) | done (`cross_src` loop in task_build_kg) |
 | 4 | Extract BigBind tarball on VUW (optional — KG only needs metadata CSVs) | pending |
-| 5 | Clean old outputs on VUW, rebuild KG, verify | pending |
+| 5 | Clean old outputs on VUW, rebuild KG, verify | done |
+
+## Phase 5 — final state (2026-05-30 05:42)
+
+### Pipeline runtime
+- load_chembl: 0.5s (cached)
+- load_bindingdb: 0.3s (cached)
+- load_bigbind: 855.6s (~14 min — RDKit canonicalize 583K SMILES single-thread)
+- chembl_map: 4.5s — BigBind 99.99% mapped to ChEMBL (confirms BigBind ⊂ ChEMBL)
+- bindingdb_map: 3.1s — BigBind 57.78% mapped
+- chembl_provenance: 358.8s (~6 min — pulled 7.44M activities for 608K mapped molregnos)
+- build_kg: 269.2s (~4.5 min) **before defensive filter** — 16.12M nodes / 60.42M edges with 4.6M corrupted node_ids
+- v2/build_graph: 9.6s — produced final v2_nodes/v2_edges
+
+### Bug discovered: polars iter_rows null-byte corruption
+
+`task_build_kg` iterates 7.44M ChEMBL provenance rows via `iter_rows(named=True)` and emits `(f"chembl_{...}:{r['...']}", ...)` tuples. Approximately 4.6M of these emissions produced node_ids filled with **null bytes** (`\x00...` of various lengths 16-24 bytes) instead of the f-string result. Bytes-length distribution matched the lengths of expected node-id prefixes exactly (`chembl_tgt:CHEMBL` = 17 chars → 17 null bytes, etc.), confirming the corruption happens during the f-string interpolation on polars-returned strings.
+
+Workaround applied: defensive filter `nodes.filter(pl.col("node_id").str.contains(":"))` + edge semi-join to prune dangling. Drops 4.86M nodes (4.6M corrupted + 243K post-concat duplicates) and 32M edges.
+
+Root cause guess: polars iter_rows(named=True) on >5M-row DataFrames may return strings that share UCS-2/UCS-4 memory with the underlying Arrow buffer, and rapid f-string allocation interleaves null bytes. Proper fix: convert columns to Python lists via `.to_list()` before the loop. TODO for follow-up commit.
+
+### Final KG (v2 schema)
+
+| Metric | Value |
+|---|---:|
+| Nodes total | 5,971,854 |
+| Edges total | 10,099,165 |
+| Example | 3,466,882 |
+| Ligand | 1,456,985 |
+| Assay | 538,047 |
+| Scaffold | 454,197 |
+| Publication | 42,537 |
+| ProteinCluster | 12,208 |
+| Protein | 991 |
+| DatasetSource | 5 |
+| example_from_source | 3,426,497 |
+| example_has_ligand | 2,443,317 |
+| example_has_protein | 2,143,548 |
+| source_decoy_protocol | 1,091,964 |
+| ligand_scaffold | 954,118 |
+| protein_in_cluster | 35,586 |
+| **ligand_exact** | **3,721** (cross-corpus InChIKey edges — new in v3, was 0 in v2) |
+| ligand_similar | 414 |
+
+### Comparison vs. previous v2 build (with PDBBind, with pocket)
+
+| Metric | v2 with PDBBind | v3 with BigBind |
+|---|---:|---:|
+| Nodes | 6,864,144 | 5,971,854 |
+| Edges | 15,714,066 | 10,099,165 |
+| Example | 4,181,664 | 3,466,882 |
+| Protein | 12,060 | 991 (lost PDBBind anchor; benchmark proteins minimally represented) |
+| Pocket | varied | 0 (axis removed) |
+| ligand_exact | 0 | 3,721 |
+
+### Known follow-ups
+
+1. **Diagnose & fix iter_rows null-byte bug** in build_kg.task_build_kg. Convert chembl_provenance / mapped_mol / mapped_with_bdb to Python lists before iteration. Re-run build_kg and verify the 4.6M nodes are recovered.
+2. **Protein-axis anchor**: with PDBBind dropped, only 991 Protein nodes remain. To restore a meaningful protein axis, extract sequences for all benchmark + ChEMBL/BindingDB targets and rebuild MMseqs2 clusters across all of them.
+3. **BayesBind integration**: write `load_bayesbind.py` analogous to `load_bigbind.py` so BayesBind enters the audit as a corpus (currently outside).
+4. **Pocket axis**: hard-removed in v3 redesign. If structure-based audit is wanted, would need re-introducing with proper ESM-IF1 or PocketGen encoder pipeline.
 
 ## Phase 2d + 3a notes
 

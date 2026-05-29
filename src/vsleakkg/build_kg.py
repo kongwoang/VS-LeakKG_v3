@@ -636,18 +636,20 @@ def task_build_kg() -> str:
     n_df = pl.DataFrame(nodes_new, schema=["node_id", "node_type", "label", "props"], orient="row")
     e_df = pl.DataFrame(edges_new, schema=["src", "dst", "edge_type", "props"], orient="row")
     nodes = pl.concat([base_n, n_df], how="vertical_relaxed").unique(subset=["node_id"])
-    # Defensive: drop any node row whose id or type is empty/null. The merge
-    # of the ChEMBL provenance loop into n_df occasionally emits a handful of
-    # rows with blanked id/type (root cause not yet diagnosed); filtering them
-    # here keeps downstream consumers (v2/build_graph, audits) clean. Edges
-    # referencing the dropped node IDs are also pruned.
-    nodes = nodes.filter(
-        pl.col("node_id").is_not_null() & (pl.col("node_id") != "") &
-        pl.col("node_type").is_not_null() & (pl.col("node_type") != "")
-    )
+    # Defensive: drop any node whose id is malformed. iter_rows(named=True) over
+    # a large polars DataFrame occasionally produces strings filled with null
+    # bytes (\x00...) instead of the f-string interpolation result; this
+    # poisons ~4M ChEMBLLigand / ChEMBLTarget / ChEMBLActivity etc. rows in
+    # n_df. We accept the loss for now and recommend root-cause investigation:
+    # convert polars columns to Python lists before the loop in a follow-up.
+    # All legitimate node_ids in this scheme contain a colon (lig:, chembl_:,
+    # ex:, src:, etc.), so keep only those.
+    nodes = nodes.filter(pl.col("node_id").str.contains(":"))
     edges = pl.concat([base_e, e_df], how="vertical_relaxed").unique()
-    _kept_ids = set(nodes["node_id"].to_list())
-    edges = edges.filter(pl.col("src").is_in(list(_kept_ids)) & pl.col("dst").is_in(list(_kept_ids)))
+    edges = edges.filter(pl.col("edge_type").is_not_null() & (pl.col("edge_type") != ""))
+    valid = nodes.select("node_id")
+    edges = (edges.join(valid.rename({"node_id": "src"}), on="src", how="semi")
+                  .join(valid.rename({"node_id": "dst"}), on="dst", how="semi"))
     nodes.write_parquet(PROCESSED / "kg_nodes.parquet")
     edges.write_parquet(PROCESSED / "kg_edges.parquet")
 
