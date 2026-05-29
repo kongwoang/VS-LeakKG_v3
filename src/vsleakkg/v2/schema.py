@@ -15,8 +15,6 @@ class NodeType(str, Enum):
     EXAMPLE = "Example"
     PROTEIN = "Protein"
     PROTEIN_CLUSTER = "ProteinCluster"  # per-resolution; props["resolution"] = "30" | "40" | "90"
-    POCKET = "Pocket"
-    POCKET_CLUSTER = "PocketCluster"
     LIGAND = "Ligand"
     SCAFFOLD = "Scaffold"
     ASSAY = "Assay"
@@ -31,7 +29,6 @@ class EdgeType(str, Enum):
     # binding edges connecting an Example to its constituent entities
     EXAMPLE_HAS_LIGAND = "example_has_ligand"
     EXAMPLE_HAS_PROTEIN = "example_has_protein"
-    EXAMPLE_HAS_POCKET = "example_has_pocket"
     EXAMPLE_FROM_ASSAY = "example_from_assay"
     EXAMPLE_FROM_PUBLICATION = "example_from_publication"
     EXAMPLE_FROM_SOURCE = "example_from_source"
@@ -44,8 +41,6 @@ class EdgeType(str, Enum):
     LIGAND_SIMILAR = "ligand_similar"  # Morgan Tanimoto >= 0.85
     PROTEIN_EXACT = "protein_exact"
     PROTEIN_IN_CLUSTER = "protein_in_cluster"  # resolution stored on the cluster node
-    POCKET_IN_CLUSTER = "pocket_in_cluster"
-    POCKET_SIMILAR = "pocket_similar"  # embedding cosine >= 0.80
     SOURCE_DECOY_PROTOCOL = "source_decoy_protocol"
     TIME_OVERLAP = "time_overlap"
 
@@ -62,9 +57,6 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "protein_cluster_90": 0.85,
     "protein_cluster_40": 0.60,
     "protein_cluster_30": 0.45,
-    EdgeType.EXAMPLE_HAS_POCKET.value: 1.00,
-    EdgeType.POCKET_IN_CLUSTER.value: 0.70,
-    EdgeType.POCKET_SIMILAR.value: 0.60,
     EdgeType.EXAMPLE_FROM_ASSAY.value: 0.75,
     EdgeType.EXAMPLE_FROM_PUBLICATION.value: 0.55,
     EdgeType.EXAMPLE_FROM_SOURCE.value: 0.35,
@@ -93,11 +85,6 @@ AXIS_EDGE_TYPES: dict[str, list[str]] = {
         EdgeType.EXAMPLE_HAS_PROTEIN.value,
         EdgeType.PROTEIN_EXACT.value,
         EdgeType.PROTEIN_IN_CLUSTER.value,
-    ],
-    "pocket": [
-        EdgeType.EXAMPLE_HAS_POCKET.value,
-        EdgeType.POCKET_IN_CLUSTER.value,
-        EdgeType.POCKET_SIMILAR.value,
     ],
     "assay": [
         EdgeType.EXAMPLE_FROM_ASSAY.value,
