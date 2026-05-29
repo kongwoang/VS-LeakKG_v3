@@ -1,9 +1,11 @@
-# v1 -> v3 move report
+# v1 + v2 -> v3 move report
 
 Date: 2026-05-29
-Source: `D:\hoangpc\VS-LeakKG` (commit `4be0e5f`)
+Sources:
+  - `D:\hoangpc\VS-LeakKG`    (commit `4be0e5f`)   -- v1 flat-schema baseline
+  - `D:\hoangpc\VS-LeakKG_v2` (working tree)        -- v2 axis-aligned redesign
 Target: `D:\hoangpc\VS-LeakKG_v3`
-Mode: **COPY** (v1 is untouched and remains a historical reference).
+Mode: **COPY** (v1 and v2 are untouched and remain historical references).
 
 ## Files copied INTO v3
 
@@ -50,6 +52,22 @@ Mode: **COPY** (v1 is untouched and remains a historical reference).
 | `data/MANIFEST.template.md` | Template for documenting fetched dataset versions |
 | `data/raw/.gitkeep`, `data/processed/.gitkeep`, `outputs/.gitkeep` | Empty dir placeholders |
 
+### `src/vsleakkg/v2/` -- v2 axis-aligned KG construction (7 files)
+
+Copied from `D:\hoangpc\VS-LeakKG_v2\src\vsleakkg\v2\` into `D:\hoangpc\VS-LeakKG_v3\src\vsleakkg\v2\`.
+
+| File | Role |
+|---|---|
+| `__init__.py` | v2 subpackage init (`__version__ = "2.0.0-dev"`) |
+| `schema.py` | Axis-aligned schema: 13 `NodeType`s incl. `POCKET`, `POCKET_CLUSTER`, `PUBLICATION`, `TRAINSET`; ~20 `EdgeType`s; `DEFAULT_WEIGHTS` (proposal.tex Table 2); `AXIS_EDGE_TYPES` mapping the 7 leakage axes to their edges. **This is the redesign target -- supersedes v1's `graph_schema.py`** |
+| `datapaths.py` | Path resolution. ⚠ Currently points at v1 repo as data source (`VSLEAKKG_V1_ROOT` env var, defaults to `D:/hoangpc/VS-LeakKG`). Rework for v3 -- either keep pointing at v1 or rebase onto v3's own `data/` |
+| `build_graph.py` | v1->v2 consolidator. `V1_TO_V2_NODE_TYPE` / `V1_TO_V2_EDGE_TYPE` maps; `_map_nodes`, `_map_edges` filter v1 parquets into v2 schema; `_synthesize_pdbbind_examples` collapses Complex->Example and emits `example_has_pocket` |
+| `build_side_table.py` | Hydrate-side-table builder. One parquet matching `hydrate.SIDE_TABLE_SCHEMA`: `example_id, source, source_id, smiles, smiles_canonical, inchikey, uniprot, target_sequence, target_sequence_saprot, pdb_id, chembl_id, bindingdb_id, assay_id, label, label_kind`. Bridges v2 `(example_id, partition)` splits to model adapters (SPRINT/DrugCLIP/LigUnity) |
+| `hydrate.py` | `make_example_id(source, source_id)` / `parse_example_id`, `SIDE_TABLE_SCHEMA`, `Hydrator` class for O(1) lookup, `canonicalize_smiles` (RDKit-only -- no hash fallback). `KnownSource` enum lists chembl/bindingdb/pdbbind/litpcba/dude/dekois/bayesbind |
+| `trainset.py` | Mode B model-specific TrainSet injection: one `TrainSet_m` node + `example_in_trainset` edges per model manifest. Resolves external IDs via id_map; unresolved rows returned (not silently dropped) |
+
+**Imports inside v2/ resolve cleanly within the copied set** -- only intra-package `from .schema`, `from .datapaths`, `from .hydrate`. No dependencies on the skipped downstream modules.
+
 ## Files NOT copied (deliberately omitted; you said you'll redesign)
 
 These v1 modules implement downstream analysis on top of the KG and are NOT carried into v3:
@@ -71,12 +89,35 @@ These v1 modules implement downstream analysis on top of the KG and are NOT carr
 | `final_tables.py`, `final_figures.py`, `final_figures_v2.py` | Paper table/figure renderers |
 | `run_mvp_audit.py`, `run_mvp1_audit.py` | Older audit orchestrators superseded by `run_overnight.py` |
 
-Also NOT copied:
-- `notebooks/`, `outputs/`, `data/raw/`, `data/processed/` actual contents (all empty in v1 anyway — datasets are pulled from HF on demand)
-- `environments/model_eval_*.yml` (LigUnity / DrugCLIP / HypSeek / Conglude eval configs — v2/Phase-3 artifacts, not KG construction)
-- `_proposal_text.txt`, `cleanup_report.md`, `reproducereport.txt`, `VS_LeakKG.pdf` — paper drafts and one-off reports
+Also NOT copied from v1:
+- `notebooks/`, `outputs/`, `data/raw/`, `data/processed/` actual contents (all empty in v1 anyway -- datasets are pulled from HF on demand)
+- `environments/model_eval_*.yml` (LigUnity / DrugCLIP / HypSeek / Conglude eval configs -- v2/Phase-3 artifacts, not KG construction)
+- `_proposal_text.txt`, `cleanup_report.md`, `reproducereport.txt`, `VS_LeakKG.pdf` -- paper drafts and one-off reports
+
+From v2, the following downstream modules were deliberately NOT copied (user is redesigning):
+
+| File | Role in v2 |
+|---|---|
+| `src/vsleakkg/v2/pipeline.py` | End-to-end Phase 1 orchestrator -- calls leakage_groups + split + validation + baselines |
+| `src/vsleakkg/v2/leakage_groups.py` | Union-find / Louvain leakage-group computation per axis |
+| `src/vsleakkg/v2/split.py` | Greedy group-atomic split assignment |
+| `src/vsleakkg/v2/scoring.py` | -log Dijkstra multi-source contamination scoring + C-NN label transfer |
+| `src/vsleakkg/v2/validation_contamination.py` | Three-way contamination matrices (train->test, train->val, val->test) |
+| `src/vsleakkg/v2/hubs.py` | Hub-node analysis |
+| `src/vsleakkg/v2/label_leakage.py` | Per-row label-leakage attribution |
+| `src/vsleakkg/v2/final_figures.py` | Paper-figure renderers |
+| `src/vsleakkg/v2/baselines/ligand_only.py` | Morgan-RF ligand-only baseline |
+| `src/vsleakkg/v2/baselines/dummy_receptor.py` | Receptor-perturbation control |
+| `tools/run_*.py`, `tools/phase*.py`, `tools/consolidate_phase1_report.py` | Phase 1/3 audit suite (~20 tools) |
+| `tools/v2_retrieval/build_*_target_kg.py`, `build_*_target_lmdbs.py` | Per-target retrieval KG builders for Phase 2 LigUnity/DrugCLIP eval |
+| `scripts/launch_*.sh`, `scripts/phase*.sh` | Phase 1/3 batch launchers |
+| `paper.tex`, `proposal.tex`, all `*REPORT*.md` / `PHASE*.md` / `SESSION_HANDOFF.md` | Manuscript drafts and run reports |
+| `outputs*/`, `tests/`, `conftest.py`, `docs/`, `mmc2.pdf` | Generated artifacts, tests, docs |
+| `pyproject.toml` (v2) | Packaging config -- v3 currently uses plain `requirements.txt` + `environment.yml`; consider adopting later |
 
 ## Caveats to be aware of in v3
+
+0. **v3 now has both v1 (flat) and v2 (axis-aligned) schemas side by side.** `src/vsleakkg/*.py` (graph_schema, build_graph, run_*) speaks the v1 schema with prefixed-ID node types (`lig:`, `tgt:`, `complex:`, ...). `src/vsleakkg/v2/*.py` speaks the v2 axis-aligned schema with the 7 leakage axes. The v2 `build_graph.py` consumes v1's processed parquets and produces v2 nodes/edges -- so the pipeline is v1-loaders -> v1-emitter -> v2-consolidator. v3 will probably want to either (a) keep this 2-stage flow but rewrite the v2 consolidator into a from-scratch builder, or (b) collapse the v1 layer and emit v2 nodes/edges directly from the load_*.py files.
 
 1. **`run_overnight.py` is not pure KG construction.** It contains 16 tasks; only `task_6_mvp2_graph` and the chembl/bindingdb loaders are graph-building. Tasks 1-5, 7-16 do contamination scoring, audits, figure generation. You'll likely want to strip those out or split this file when you start v3 modifications.
 
@@ -89,6 +130,12 @@ Also NOT copied:
 5. **No ChEMBL <-> PDBBind target merging.** `pdbbind_chembl_target_match.py` writes a `pdbbind_chembl_target_matches.parquet` side-table but `task_6_mvp2_graph` never reads it, so `ProteinTarget` and `ChEMBLTarget` remain disconnected in the v1 graph.
 
 6. **Datasets are not in this repo.** `data/raw` and `data/processed` are empty. Run `scripts/fetch_dataset.sh` (needs HF token) to pull `kongwoang/VS_LeakKG :: VS-LeakKG_raw_datasets_20260519.zip`.
+
+7. **v2 `datapaths.py` still points at v1 repo.** It reads `VSLEAKKG_V1_ROOT` env var, defaulting to `D:/hoangpc/VS-LeakKG` (Win) or `~/VS-LeakKG` (Linux). On VUW this means the v2 build_graph expects the v1 clone to also be present at `/vol/dl-nguyenb5-solar/users/hoangpc/VS-LeakKG`. Decide whether v3 should keep this cross-repo dependency or self-host its data.
+
+8. **v2 `build_graph.py` silently drops v1 ChEMBLLigand/ChEMBLTarget/ChEMBLActivity/BindingDBLigand nodes** during v1->v2 mapping (they're not in `V1_TO_V2_NODE_TYPE`). v2 keeps only `ChEMBLAssay -> Assay` and `ChEMBLDocument -> Publication`. If v3 wants ChEMBL/BindingDB to contribute Ligand or Protein nodes in the axis-aligned schema, this map must be extended.
+
+9. **v2 `pocket_similar` and `pocket_in_cluster` edges are NOT generated by any copied module.** Same gap as v1 caveat 4 above. `schema.py` declares the edge types, `build_graph.py` does not emit them. To make the pocket axis feasible for DEKOIS/DUD-E/LIT-PCBA in v3, you need an upstream pocket-clustering or pocket-similarity step (ESM-IF1 embeddings, foldseek, or AA-composition KMeans).
 
 ## Git setup applied
 
