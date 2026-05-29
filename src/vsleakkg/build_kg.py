@@ -658,12 +658,18 @@ def task_build_kg() -> str:
 
 # -------- main --------
 TASKS = [
+    # ChEMBL / BindingDB raw extracts (cached after first run).
     ("load_chembl",       task_load_chembl),
     ("load_bindingdb",    task_load_bindingdb),
+    # Per-corpus loaders that produce <corpus>_examples/_nodes/_edges parquets.
+    # Has to run BEFORE chembl_map/bindingdb_map so its ligands are included in
+    # the benchmark <-> reference cross-ref maps.
+    ("load_bigbind",      task_load_bigbind),
+    # Cross-reference maps + activity provenance (depend on all corpus parquets).
     ("chembl_map",        task_chembl_map),
     ("bindingdb_map",     task_bindingdb_map),
     ("chembl_provenance", task_chembl_provenance),
-    ("load_bigbind",      task_load_bigbind),
+    # Final KG assembly: concat per-corpus + ChEMBL/BindingDB cross-ref layer.
     ("build_kg",          task_build_kg),
 ]
 
