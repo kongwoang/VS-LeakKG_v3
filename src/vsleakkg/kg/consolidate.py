@@ -395,7 +395,12 @@ def _wire_reference_provenance(
                                         how="vertical_relaxed")
             n_synth_pub += ex_to_doc.height
 
-        # Activity -> Assay, same aggregated pattern.
+        # Activity -> Assay, same aggregated pattern. The full join produces
+        # ~57M Example->Assay pairs which is enough to OOM a 96 GB box once
+        # combined with the dangling-prune frame. Cap each benchmark Ligand
+        # to at most _ASSAY_CAP_PER_LIG distinct Assays (keeps the
+        # quantitative-assay audit signal, drops promiscuous HTS noise).
+        _ASSAY_CAP_PER_LIG = 20
         act_asy = (raw_edges.filter(
                 pl.col("edge_type") == "chembl_activity_has_assay")
             .select([pl.col("src").alias("chembl_act_id"),
@@ -408,8 +413,15 @@ def _wire_reference_provenance(
             bench_to_asy = (bench_to_chembl
                             .join(chembl_lig_to_asy, on="chembl_lid", how="inner")
                             .select(["bench_lid", "chembl_asy_id"]).unique())
-            log.info("  chembl: %d unique chembl_lig->asy, %d bench->asy",
-                     chembl_lig_to_asy.height, bench_to_asy.height)
+            # Cap: keep deterministic top-N assays per benchmark Ligand.
+            bench_to_asy = (bench_to_asy.sort(["bench_lid", "chembl_asy_id"])
+                            .with_columns(
+                                pl.col("chembl_asy_id").cum_count()
+                                  .over("bench_lid").alias("_rk"))
+                            .filter(pl.col("_rk") <= _ASSAY_CAP_PER_LIG)
+                            .drop("_rk"))
+            log.info("  chembl: %d unique chembl_lig->asy, %d bench->asy (capped at %d/lig)",
+                     chembl_lig_to_asy.height, bench_to_asy.height, _ASSAY_CAP_PER_LIG)
             ex_to_asy = (ex_lig
                          .join(bench_to_asy, on="bench_lid", how="inner")
                          .select([pl.col("example_id").alias("src"),
