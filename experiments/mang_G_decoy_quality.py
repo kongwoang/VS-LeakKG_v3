@@ -140,21 +140,28 @@ def run(args: argparse.Namespace) -> None:
     print(f"per_decoy unique rows: {per_decoy.height:,}", flush=True)
     per_decoy.write_parquet(out / "decoy_with_real_activity.parquet")
 
+    # A single decoy_id can appear multiple times in per_decoy when its
+    # Example node touches multiple (lig, target) combinations via the wire
+    # (e.g. BindingDB Protein wire adds extra example_has_protein edges).
+    # Count UNIQUE decoy_ids for the summary so pct_dirty stays in [0, 100].
+    n_dirty_per_source = (
+        per_decoy.group_by("source")
+        .agg(pl.col("decoy_id").n_unique().alias("n_dirty_decoys"))
+    )
     summary = (decoys.group_by("source").agg([
         pl.len().alias("n_decoys"),
-    ]).join(
-        per_decoy.group_by("source").len().rename({"len": "n_active_elsewhere"}),
-        on="source", how="left",
-    ).with_columns(
-        pl.col("n_active_elsewhere").fill_null(0).alias("n_active_elsewhere"),
-    ).with_columns(
-        (100 * pl.col("n_active_elsewhere") / pl.col("n_decoys")).round(2).alias("pct_dirty"),
-    ).sort("pct_dirty", descending=True))
+    ]).join(n_dirty_per_source, on="source", how="left")
+        .with_columns(pl.col("n_dirty_decoys").fill_null(0))
+        .with_columns(
+            (100 * pl.col("n_dirty_decoys") / pl.col("n_decoys")).round(2).alias("pct_dirty"),
+        ).sort("pct_dirty", descending=True))
     summary.write_csv(out / "decoy_quality_summary.csv")
 
     lines = ["# Mảng G — Decoy quality audit", ""]
+    n_unique_dirty = int(per_decoy.select(pl.col("decoy_id").n_unique()).item())
     lines.append(f"- total decoys scanned: {decoys.height:,}")
-    lines.append(f"- decoys that have real activity on another target: {per_decoy.height:,}")
+    lines.append(f"- decoys that have real activity on another target: {n_unique_dirty:,} unique decoy_ids "
+                 f"({per_decoy.height:,} raw (decoy_id, lig, target) tuples)")
     lines.append("")
     lines.append("## Per-corpus decoy quality")
     lines.append(summary.to_pandas().to_markdown(index=False))
