@@ -558,55 +558,99 @@ def task_build_kg() -> str:
                                                   "canonical_smiles", "standard_inchi_key"]),
                               on="molregno", how="left")
                   .unique(subset=["molregno"]))
-    for r in mapped_mol.iter_rows(named=True):
-        nid = f"chembl_lig:{r['molecule_chembl_id']}"
-        nodes_new.append((nid, "ChEMBLLigand", r['molecule_chembl_id'],
-                          json.dumps({"molregno": int(r["molregno"]) if r["molregno"] is not None else None,
-                                       "canonical_smiles": r.get("canonical_smiles_right") or r.get("canonical_smiles"),
-                                       "inchikey": r.get("standard_inchi_key")})))
+    # Pull columns to Python lists before the loop. iter_rows(named=True) over
+    # large polars DataFrames (>5M rows in the chembl_provenance case) corrupts
+    # strings — f-string interpolation returns null-byte-filled strings of the
+    # expected length instead of the actual text. Working off plain lists avoids
+    # the bug entirely.
+    mm_molregno = mapped_mol["molregno"].to_list()
+    mm_chid = mapped_mol["molecule_chembl_id"].to_list()
+    mm_smi_right = mapped_mol["canonical_smiles_right"].to_list() if "canonical_smiles_right" in mapped_mol.columns else [None] * mapped_mol.height
+    mm_smi_left = mapped_mol["canonical_smiles"].to_list()
+    mm_ik = mapped_mol["standard_inchi_key"].to_list()
+    mm_match = mapped_mol["match_method"].to_list()
+    for i in range(mapped_mol.height):
+        chid = mm_chid[i]
+        if chid is None:
+            continue
+        nid = f"chembl_lig:{chid}"
+        # mm_smi_left = canonical_smiles from benchmark_to_chembl_ligand_map,
+        # which comes from the benchmark _examples parquet (RDKit-canonical
+        # via the same vsleakkg.chem.featurize pipeline as the per-corpus
+        # Ligand nodes). Use THIS for the benchmark_lid lookup so the edge
+        # lands on the right Ligand node. Store the ChEMBL-side canonical
+        # in the ChEMBLLigand props for traceability.
+        bench_smi = mm_smi_left[i]
+        chembl_smi = mm_smi_right[i]
+        nodes_new.append((nid, "ChEMBLLigand", chid,
+                          json.dumps({"molregno": int(mm_molregno[i]) if mm_molregno[i] is not None else None,
+                                       "canonical_smiles_chembl": chembl_smi,
+                                       "canonical_smiles_benchmark": bench_smi,
+                                       "inchikey": mm_ik[i]})))
         edges_new.append((nid, "src:ChEMBL35", "chembl_ligand_from_source", "{}"))
-        benchmark_lid = _lig_node_id(r["canonical_smiles_right"] if r.get("canonical_smiles_right") else r["canonical_smiles"])
-        edges_new.append((benchmark_lid, nid,
-                          "benchmark_ligand_same_inchikey_as_chembl_ligand",
-                          json.dumps({"match_method": r.get("match_method")})))
-        edges_new.append((benchmark_lid, nid, "ligand_also_in_chembl", "{}"))
+        if bench_smi:
+            benchmark_lid = _lig_node_id(bench_smi)
+            edges_new.append((benchmark_lid, nid,
+                              "benchmark_ligand_same_inchikey_as_chembl_ligand",
+                              json.dumps({"match_method": mm_match[i]})))
+            edges_new.append((benchmark_lid, nid, "ligand_also_in_chembl", "{}"))
 
     if not prov.is_empty():
+        # Same defensive extraction for the 7M+ provenance rows.
+        prov_clean = prov.filter(pl.col("activity_id").is_not_null())
+        p_aid = prov_clean["activity_id"].to_list()
+        p_mol = prov_clean["molecule_chembl_id"].to_list()
+        p_stype = prov_clean["standard_type"].to_list()
+        p_sval = prov_clean["standard_value"].to_list()
+        p_sun = prov_clean["standard_units"].to_list()
+        p_pch = prov_clean["pchembl_value"].to_list()
+        p_asy = prov_clean["assay_chembl_id"].to_list()
+        p_doc = prov_clean["document_chembl_id"].to_list()
+        p_tgt = prov_clean["target_chembl_id"].to_list()
+
         assays_seen, docs_seen, targets_seen, acts_seen = set(), set(), set(), set()
-        for r in prov.filter(pl.col("activity_id").is_not_null()).iter_rows(named=True):
-            aid = int(r["activity_id"])
+        for i in range(prov_clean.height):
+            aid_raw = p_aid[i]
+            if aid_raw is None:
+                continue
+            aid = int(aid_raw)
             if aid in acts_seen:
                 continue
             acts_seen.add(aid)
-            chembl_lid = f"chembl_lig:{r['molecule_chembl_id']}"
+            mol_chid = p_mol[i]
+            chembl_lid = f"chembl_lig:{mol_chid}"
             act_nid = f"chembl_act:{aid}"
             nodes_new.append((act_nid, "ChEMBLActivity", str(aid),
-                              json.dumps({"standard_type": r.get("standard_type"),
-                                           "standard_value": r.get("standard_value"),
-                                           "standard_units": r.get("standard_units"),
-                                           "pchembl_value": r.get("pchembl_value")})))
+                              json.dumps({"standard_type": p_stype[i],
+                                           "standard_value": p_sval[i],
+                                           "standard_units": p_sun[i],
+                                           "pchembl_value": p_pch[i]})))
             edges_new.append((act_nid, chembl_lid, "chembl_activity_has_ligand", "{}"))
-            if r.get("assay_chembl_id"):
-                asy_nid = f"chembl_asy:{r['assay_chembl_id']}"
-                if r["assay_chembl_id"] not in assays_seen:
-                    nodes_new.append((asy_nid, "ChEMBLAssay", r["assay_chembl_id"], "{}"))
-                    assays_seen.add(r["assay_chembl_id"])
+            asy_chid = p_asy[i]
+            if asy_chid:
+                asy_nid = f"chembl_asy:{asy_chid}"
+                if asy_chid not in assays_seen:
+                    nodes_new.append((asy_nid, "ChEMBLAssay", asy_chid, "{}"))
+                    assays_seen.add(asy_chid)
                 edges_new.append((act_nid, asy_nid, "chembl_activity_has_assay", "{}"))
-                if r.get("document_chembl_id"):
-                    edges_new.append((asy_nid, f"chembl_doc:{r['document_chembl_id']}",
+                doc_chid = p_doc[i]
+                if doc_chid:
+                    edges_new.append((asy_nid, f"chembl_doc:{doc_chid}",
                                        "chembl_assay_from_document", "{}"))
-            if r.get("document_chembl_id"):
-                doc_nid = f"chembl_doc:{r['document_chembl_id']}"
-                if r["document_chembl_id"] not in docs_seen:
-                    nodes_new.append((doc_nid, "ChEMBLDocument", r["document_chembl_id"], "{}"))
-                    docs_seen.add(r["document_chembl_id"])
+            doc_chid = p_doc[i]
+            if doc_chid:
+                doc_nid = f"chembl_doc:{doc_chid}"
+                if doc_chid not in docs_seen:
+                    nodes_new.append((doc_nid, "ChEMBLDocument", doc_chid, "{}"))
+                    docs_seen.add(doc_chid)
                 edges_new.append((act_nid, doc_nid, "chembl_activity_has_document", "{}"))
                 edges_new.append((doc_nid, "src:ChEMBL35", "chembl_document_from_source", "{}"))
-            if r.get("target_chembl_id"):
-                tgt_nid = f"chembl_tgt:{r['target_chembl_id']}"
-                if r["target_chembl_id"] not in targets_seen:
-                    nodes_new.append((tgt_nid, "ChEMBLTarget", r["target_chembl_id"], "{}"))
-                    targets_seen.add(r["target_chembl_id"])
+            tgt_chid = p_tgt[i]
+            if tgt_chid:
+                tgt_nid = f"chembl_tgt:{tgt_chid}"
+                if tgt_chid not in targets_seen:
+                    nodes_new.append((tgt_nid, "ChEMBLTarget", tgt_chid, "{}"))
+                    targets_seen.add(tgt_chid)
                 edges_new.append((act_nid, tgt_nid, "chembl_activity_has_target", "{}"))
 
     # ---- BindingDB ligand subgraph ----
@@ -616,34 +660,44 @@ def task_build_kg() -> str:
     bdb_lig_ik = bdb_lig.unique(subset=["ligand_inchikey"])
     mapped_with_bdb = mapped_bdb.join(bdb_lig_ik.rename({"ligand_inchikey": "inchikey"}),
                                        on="inchikey", how="left")
+    # Same defensive pattern for the BindingDB loop.
+    b_ik = mapped_with_bdb["inchikey"].to_list()
+    b_smi = mapped_with_bdb["canonical_smiles"].to_list()
+    b_lsmi = mapped_with_bdb["ligand_smiles"].to_list()
+    b_chid = mapped_with_bdb["chembl_id_ligand"].to_list()
+    b_zinc = mapped_with_bdb["zinc_id_ligand"].to_list()
+    b_match = mapped_with_bdb["match_method"].to_list()
     seen_bdb = set()
-    for r in mapped_with_bdb.iter_rows(named=True):
-        nid = f"bdb_lig:{r['inchikey']}"
-        if r["inchikey"] not in seen_bdb:
-            nodes_new.append((nid, "BindingDBLigand", r["inchikey"],
-                              json.dumps({"smiles": r.get("ligand_smiles"),
-                                           "chembl_id_ligand": r.get("chembl_id_ligand"),
-                                           "zinc_id_ligand": r.get("zinc_id_ligand")})))
+    for i in range(mapped_with_bdb.height):
+        ik = b_ik[i]
+        if not ik:
+            continue
+        nid = f"bdb_lig:{ik}"
+        if ik not in seen_bdb:
+            nodes_new.append((nid, "BindingDBLigand", ik,
+                              json.dumps({"smiles": b_lsmi[i],
+                                           "chembl_id_ligand": b_chid[i],
+                                           "zinc_id_ligand": b_zinc[i]})))
             edges_new.append((nid, "src:BindingDB202605", "bindingdb_record_from_source", "{}"))
-            seen_bdb.add(r["inchikey"])
-        benchmark_lid = _lig_node_id(r["canonical_smiles"])
-        edges_new.append((benchmark_lid, nid, "ligand_also_in_bindingdb", "{}"))
-        edges_new.append((benchmark_lid, nid,
-                          "benchmark_ligand_same_inchikey_as_bindingdb_ligand",
-                          json.dumps({"match_method": r.get("match_method")})))
+            seen_bdb.add(ik)
+        bench_smi = b_smi[i]
+        if bench_smi:
+            benchmark_lid = _lig_node_id(bench_smi)
+            edges_new.append((benchmark_lid, nid, "ligand_also_in_bindingdb", "{}"))
+            edges_new.append((benchmark_lid, nid,
+                              "benchmark_ligand_same_inchikey_as_bindingdb_ligand",
+                              json.dumps({"match_method": b_match[i]})))
 
     # ---- Persist ----
     n_df = pl.DataFrame(nodes_new, schema=["node_id", "node_type", "label", "props"], orient="row")
     e_df = pl.DataFrame(edges_new, schema=["src", "dst", "edge_type", "props"], orient="row")
     nodes = pl.concat([base_n, n_df], how="vertical_relaxed").unique(subset=["node_id"])
-    # Defensive: drop any node whose id is malformed. iter_rows(named=True) over
-    # a large polars DataFrame occasionally produces strings filled with null
-    # bytes (\x00...) instead of the f-string interpolation result; this
-    # poisons ~4M ChEMBLLigand / ChEMBLTarget / ChEMBLActivity etc. rows in
-    # n_df. We accept the loss for now and recommend root-cause investigation:
-    # convert polars columns to Python lists before the loop in a follow-up.
-    # All legitimate node_ids in this scheme contain a colon (lig:, chembl_:,
-    # ex:, src:, etc.), so keep only those.
+    # Defensive: keep only node_ids matching our prefixed-ID scheme (contain
+    # a colon). The iter_rows null-byte bug that poisoned ~4M nodes in the
+    # earlier build has been fixed (columns pre-extracted via .to_list()), so
+    # this filter is now a belt-and-suspenders invariant rather than the
+    # primary cleanup. If it ever drops a non-trivial fraction of rows, look
+    # for new iter_rows usage that needs the same treatment.
     nodes = nodes.filter(pl.col("node_id").str.contains(":"))
     edges = pl.concat([base_e, e_df], how="vertical_relaxed").unique()
     edges = edges.filter(pl.col("edge_type").is_not_null() & (pl.col("edge_type") != ""))
