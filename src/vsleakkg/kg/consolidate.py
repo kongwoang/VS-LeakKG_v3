@@ -188,6 +188,86 @@ def _map_edges(edges: pl.DataFrame) -> tuple[pl.DataFrame, int]:
     return kept, n_in - kept.height
 
 
+# UniProt accession formats (https://www.uniprot.org/help/accession_numbers):
+#   6-char: [OPQ][0-9][A-Z0-9]{3}[0-9]  OR  [A-NR-Z][0-9][A-Z][A-Z0-9]{2}[0-9]
+#   10-char (extended, since 2014): [A-NR-Z][0-9][A-Z][A-Z0-9]{2}[0-9][A-Z][A-Z0-9]{2}[0-9]
+_UNIPROT_RE = (
+    r"^([OPQ][0-9][A-Z0-9]{3}[0-9]"
+    r"|[A-NR-Z][0-9][A-Z][A-Z0-9]{2}[0-9]"
+    r"|[A-NR-Z][0-9][A-Z][A-Z0-9]{2}[0-9][A-Z][A-Z0-9]{2}[0-9])$"
+)
+
+
+def _normalize_protein_ids(
+    nodes: pl.DataFrame, edges: pl.DataFrame
+) -> tuple[pl.DataFrame, pl.DataFrame, int]:
+    """Collapse `tgt:Corpus:UniProtID` Protein nodes onto canonical
+    `protein:UniProtID`.
+
+    The per-corpus loaders prefix Protein node_ids with `tgt:<Corpus>:` even
+    when the corpus already provides a clean UniProt accession (e.g. BigBind,
+    BayesBind). BindingDB enrichment + cluster edges use the canonical
+    `protein:<UniProt>` form. Without this normalisation the same UniProt
+    becomes two distinct Protein nodes — ~1k overlap on BigBind alone —
+    which splits the protein axis and silently weakens the audit.
+
+    Strategy: detect node_ids matching `^tgt:[^:]+:<UniProtRegex>$`, rewrite
+    them to `protein:<UniProtRegex>`, dedup Protein nodes by id (keep
+    first row's props), then rewrite edge src/dst with the same mapping.
+    """
+    mapping = (
+        nodes.filter(pl.col("node_type") == NodeType.PROTEIN.value)
+        .with_columns(
+            pl.col("node_id")
+            .str.extract(r"^tgt:[^:]+:(.+)$", 1)
+            .alias("_suffix")
+        )
+        .filter(
+            pl.col("_suffix").is_not_null()
+            & pl.col("_suffix").str.contains(_UNIPROT_RE)
+        )
+        .select(
+            pl.col("node_id").alias("old_id"),
+            (pl.lit("protein:") + pl.col("_suffix")).alias("new_id"),
+        )
+    )
+    if not mapping.height:
+        return nodes, edges, 0
+    n_remapped = mapping.height
+    # Apply to nodes: rewrite id, then drop duplicate ids (keep first).
+    nodes_out = (
+        nodes.join(mapping, left_on="node_id", right_on="old_id", how="left")
+        .with_columns(
+            pl.when(pl.col("new_id").is_not_null())
+            .then(pl.col("new_id"))
+            .otherwise(pl.col("node_id"))
+            .alias("node_id")
+        )
+        .drop("new_id")
+        .unique(subset=["node_id"], keep="first")
+    )
+    # Apply to edges: rewrite src and dst the same way.
+    edges_out = (
+        edges.join(mapping, left_on="src", right_on="old_id", how="left")
+        .with_columns(
+            pl.when(pl.col("new_id").is_not_null())
+            .then(pl.col("new_id"))
+            .otherwise(pl.col("src"))
+            .alias("src")
+        )
+        .drop("new_id")
+        .join(mapping, left_on="dst", right_on="old_id", how="left")
+        .with_columns(
+            pl.when(pl.col("new_id").is_not_null())
+            .then(pl.col("new_id"))
+            .otherwise(pl.col("dst"))
+            .alias("dst")
+        )
+        .drop("new_id")
+    )
+    return nodes_out, edges_out, n_remapped
+
+
 def _drop_trivial_scaffolds(
     nodes: pl.DataFrame,
     edges: pl.DataFrame,
@@ -564,6 +644,16 @@ def consolidate(
     log.info("mapped: n_nodes=%d (-%d), n_edges=%d (-%d)",
              nodes.height, dropped_n, edges.height, dropped_e)
 
+    # Collapse `tgt:Corpus:UniProtID` Protein nodes onto canonical
+    # `protein:UniProtID` so the protein axis isn't split across two synonyms.
+    nodes, edges, n_protein_collapsed = _normalize_protein_ids(nodes, edges)
+    if n_protein_collapsed:
+        log.info("collapsed %d tgt:Corpus:UniProt Protein nodes onto protein:UniProt",
+                 n_protein_collapsed)
+        stats.deferred = (stats.deferred or []) + [
+            f"protein_id_collapsed={n_protein_collapsed}"
+        ]
+
     nodes, edges = _add_protein_cluster_edges(edges, nodes, processed, stats)
     log.info("after cluster edges: n_nodes=%d, n_edges=%d", nodes.height, edges.height)
 
@@ -625,24 +715,49 @@ def consolidate(
                  dict(by_type.iter_rows()))
         stats.deferred = (stats.deferred or []) + [f"dropped_orphans={dropped_orphans}"]
 
-    # Dedup is only needed for `ligand_similar` (per-corpus loader's
-    # ligand_similar_to_ligand collides with D5's ligand_similar after the
-    # canonical mapping). Every other edge type has globally unique
-    # (src, dst) pairs by construction. Doing a global `unique` on 38M+
-    # edges would OOM; doing the targeted dedup on the 450K ligand_similar
-    # subset stays well under memory.
+    # Targeted dedup (a global `unique` on 38M+ edges OOMs the 22 GB box):
+    #   - `ligand_similar`: per-corpus loader emits `ligand_similar_to_ligand`
+    #     which collides with D5's `ligand_similar` after canonical mapping,
+    #     and the upstream sim job doesn't enforce src<dst on the unordered
+    #     pair, so 120 pairs land in both directions. Force sorted-pair, then
+    #     dedup.
+    #   - `example_has_protein`: protein-id normalisation can collapse a
+    #     corpus `tgt:BigBind:X` Protein onto the canonical `protein:X`,
+    #     leaving a duplicate Example -> protein:X edge if both the corpus
+    #     loader and the BindingDB wire pointed at the same UniProt.
+    # Every other edge type has globally unique (src, dst) by construction.
     ls = edges.filter(pl.col("edge_type") == "ligand_similar")
     if ls.height:
         n_before_e = ls.height
-        ls = ls.unique(subset=["src", "dst"], keep="first")
+        ls = ls.with_columns([
+            pl.min_horizontal("src", "dst").alias("_a"),
+            pl.max_horizontal("src", "dst").alias("_b"),
+        ]).with_columns([
+            pl.col("_a").alias("src"),
+            pl.col("_b").alias("dst"),
+        ]).drop(["_a", "_b"]).unique(subset=["src", "dst"], keep="first")
         deduped = n_before_e - ls.height
         edges = pl.concat([
             edges.filter(pl.col("edge_type") != "ligand_similar"),
             ls,
         ], how="vertical_relaxed")
         if deduped:
-            log.info("deduped %d redundant ligand_similar edges", deduped)
+            log.info("deduped %d redundant ligand_similar edges (incl. bidir)", deduped)
             stats.deferred = (stats.deferred or []) + [f"deduped_ligand_similar={deduped}"]
+
+    ehp = edges.filter(pl.col("edge_type") == "example_has_protein")
+    if ehp.height:
+        n_before_p = ehp.height
+        ehp = ehp.unique(subset=["src", "dst"], keep="first")
+        deduped_p = n_before_p - ehp.height
+        edges = pl.concat([
+            edges.filter(pl.col("edge_type") != "example_has_protein"),
+            ehp,
+        ], how="vertical_relaxed")
+        if deduped_p:
+            log.info("deduped %d redundant example_has_protein edges (post protein-id collapse)",
+                     deduped_p)
+            stats.deferred = (stats.deferred or []) + [f"deduped_example_has_protein={deduped_p}"]
 
     # Already eager DataFrames at this point.
     nodes_df = nodes
