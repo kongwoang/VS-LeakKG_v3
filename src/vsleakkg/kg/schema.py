@@ -38,6 +38,7 @@ class EdgeType(str, Enum):
     # identity / similarity edges between content nodes
     LIGAND_EXACT = "ligand_exact"               # same full InChIKey, different SMILES
     LIGAND_PARENT_EXACT = "ligand_parent_exact" # same parent (salt-stripped) InChIKey
+    LIGAND_FINGERPRINT_EXACT = "ligand_fingerprint_exact"   # ECFP4 Tanimoto = 1.0, different SMILES (typically stereo)
     LIGAND_SCAFFOLD = "ligand_scaffold"
     LIGAND_SIMILAR = "ligand_similar"           # Morgan Tanimoto >= 0.85
     PROTEIN_EXACT = "protein_exact"
@@ -51,7 +52,8 @@ class EdgeType(str, Enum):
 DEFAULT_WEIGHTS: dict[str, float] = {
     EdgeType.EXAMPLE_HAS_LIGAND.value: 1.00,
     EdgeType.LIGAND_EXACT.value: 1.00,
-    EdgeType.LIGAND_PARENT_EXACT.value: 0.95,   # salt/protonation variant — near-identical leak
+    EdgeType.LIGAND_PARENT_EXACT.value: 0.95,         # salt/protonation variant — near-identical leak
+    EdgeType.LIGAND_FINGERPRINT_EXACT.value: 0.95,    # ECFP4 = same: stereo / tautomer the fp can't see
     EdgeType.LIGAND_SCAFFOLD.value: 0.70,
     EdgeType.LIGAND_SIMILAR.value: 0.65,
     EdgeType.EXAMPLE_HAS_PROTEIN.value: 1.00,
@@ -78,6 +80,7 @@ AXIS_EDGE_TYPES: dict[str, list[str]] = {
         EdgeType.EXAMPLE_HAS_LIGAND.value,
         EdgeType.LIGAND_EXACT.value,
         EdgeType.LIGAND_PARENT_EXACT.value,
+        EdgeType.LIGAND_FINGERPRINT_EXACT.value,
         EdgeType.LIGAND_SIMILAR.value,
     ],
     "scaffold": [

@@ -100,6 +100,7 @@ CORPUS_TO_CANONICAL_EDGE_TYPE: dict[str, str] = {
     "ligand_has_scaffold": EdgeType.LIGAND_SCAFFOLD.value,
     "ligand_similar_to_ligand": EdgeType.LIGAND_SIMILAR.value,
     "ligand_similar": EdgeType.LIGAND_SIMILAR.value,    # ligand_similarity.py emits this name directly
+    "ligand_fingerprint_exact": EdgeType.LIGAND_FINGERPRINT_EXACT.value,
     "same_inchikey_as": EdgeType.LIGAND_EXACT.value,
     "same_parent_inchikey_as": EdgeType.LIGAND_PARENT_EXACT.value,
     "example_uses_decoy_protocol": EdgeType.SOURCE_DECOY_PROTOCOL.value,
@@ -405,6 +406,27 @@ def consolidate(
     if pruned:
         log.info("pruned %d dangling edges", pruned)
         stats.deferred = (stats.deferred or []) + [f"pruned_dangling_edges={pruned}"]
+
+    # Drop orphan Protein and ProteinCluster nodes (degree-0 after pruning).
+    # The KG keeps Proteins emitted by BindingDB enrichment for UniProts that
+    # don't touch any benchmark Example, and ProteinClusters whose members'
+    # accessions aren't represented in the KG. Both clutter the canonical
+    # output without contributing audit signal.
+    touched_ids = pl.concat(
+        [edges.select(pl.col("src").alias("node_id")),
+         edges.select(pl.col("dst").alias("node_id"))],
+        how="vertical_relaxed",
+    ).unique()
+    orphan_types = ("Protein", "ProteinCluster")
+    n_before_n = nodes.height
+    nodes = nodes.filter(
+        ~pl.col("node_type").is_in(list(orphan_types))
+        | pl.col("node_id").is_in(touched_ids["node_id"])
+    )
+    dropped_orphans = n_before_n - nodes.height
+    if dropped_orphans:
+        log.info("dropped %d orphan Protein/ProteinCluster nodes", dropped_orphans)
+        stats.deferred = (stats.deferred or []) + [f"dropped_orphan_proteins_clusters={dropped_orphans}"]
 
     # Already eager DataFrames at this point.
     nodes_df = nodes

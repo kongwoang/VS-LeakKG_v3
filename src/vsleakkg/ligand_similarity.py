@@ -213,27 +213,45 @@ def compute_ligand_similar_edges(
     log.info("found %d similar pairs in %.1fs", len(pairs), sim_time)
 
     # 5) Convert to edge DataFrame: ensure src < dst lexicographically.
+    # Pairs with Tanimoto == 1.0 are tagged `ligand_fingerprint_exact` rather
+    # than `ligand_similar` — they're the same molecule modulo stereo /
+    # tautomer detail that ECFP4 (radius=2) doesn't encode, so the audit
+    # should treat them as near-identity (weight 0.95) instead of weak
+    # similarity (weight 0.65). T < 1.0 stays as `ligand_similar`.
     rows = []
     import json
+    n_fp_exact = 0
+    n_similar = 0
     for q, t, s in pairs:
         a, b = lids[q], lids[t]
         if a > b:
             a, b = b, a
-        rows.append((a, b, "ligand_similar",
+        et = "ligand_fingerprint_exact" if s >= 0.9995 else "ligand_similar"
+        if et == "ligand_fingerprint_exact":
+            n_fp_exact += 1
+        else:
+            n_similar += 1
+        rows.append((a, b, et,
                      json.dumps({"tanimoto": round(s, 4),
                                   "fp_type": "ECFP4_2048bit",
                                   "method": "bit_bound_exact"})))
     edges = pl.DataFrame(rows, schema=["src", "dst", "edge_type", "props"],
                          orient="row").unique(subset=["src", "dst", "edge_type"])
-    log.info("emitted %d ligand_similar edges (deduped)", edges.height)
+    log.info("emitted %d ligand_fingerprint_exact + %d ligand_similar edges (%d total after dedup)",
+             n_fp_exact, n_similar, edges.height)
     return edges
 
 
 def append_to_kg(edges_path: Path, new_edges: pl.DataFrame) -> int:
-    """Append the new edges to the existing kg_edges parquet (with dedup)."""
+    """Append the new edges to the existing kg_edges parquet (with dedup).
+
+    Drops any prior `ligand_similar` and `ligand_fingerprint_exact` edges
+    first so a re-run with different thresholds / split logic fully
+    overwrites the previous output instead of accumulating.
+    """
     existing = pl.read_parquet(edges_path)
-    # Drop any old ligand_similar edges so we can fully recompute.
-    existing = existing.filter(pl.col("edge_type") != "ligand_similar")
+    drop = {"ligand_similar", "ligand_fingerprint_exact"}
+    existing = existing.filter(~pl.col("edge_type").is_in(list(drop)))
     merged = pl.concat([existing, new_edges], how="vertical_relaxed").unique()
     merged.write_parquet(edges_path)
     return merged.height
