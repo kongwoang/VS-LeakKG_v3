@@ -222,40 +222,75 @@ _PROTOCOLS: dict[str, Callable] = {
 # ---------------------------------------------------------------------------
 
 
-def measure_residual_leak(
-    split: pl.DataFrame, kg_dir: Path, k_hops: tuple[int, ...] = (1, 2, 3)
-) -> pl.DataFrame:
-    """% of test items reachable from train within k hops on the leak subgraph.
-
-    Always returns a frame with the same (k_hop, n_test, n_leak, pct_leak)
-    schema, even when the protocol collapsed test to 0 — that's itself a
-    meaningful outcome (every test was deemed contaminated).
-    """
-    _, all_edges = load_canonical_kg(kg_dir)
-    leak_edges = all_edges.filter(pl.col("edge_type").is_in([
+# Per-axis leak edge sets. The "full" composition is what a graph-wide BFS
+# would walk; the per-axis variants let us decompose where each split
+# protocol's residual leak flows. Within a single corpus all examples share
+# their target → any axis that includes example_has_protein trivially
+# saturates at k=2; we therefore measure protein leak through
+# protein_in_cluster only, and assay/paper through their direct
+# example_from_* edges (no example_has_protein bridge).
+_AXIS_EDGE_SETS: dict[str, tuple[str, ...]] = {
+    "full": (
         "example_has_ligand", "example_has_protein",
         "example_from_publication", "example_from_assay",
         "ligand_similar", "ligand_exact", "ligand_parent_exact",
         "ligand_fingerprint_exact", "ligand_scaffold", "protein_in_cluster",
-    ])).select(["src", "dst"])
+    ),
+    "ligand": (
+        "example_has_ligand",
+        "ligand_similar", "ligand_exact", "ligand_parent_exact",
+        "ligand_fingerprint_exact",
+    ),
+    "scaffold": (
+        "example_has_ligand", "ligand_scaffold",
+    ),
+    "protein": (
+        "example_has_protein", "protein_in_cluster",
+    ),
+    "publication": (
+        "example_from_publication",
+    ),
+    "assay": (
+        "example_from_assay",
+    ),
+}
+
+
+def measure_residual_leak(
+    split: pl.DataFrame, kg_dir: Path, k_hops: tuple[int, ...] = (1, 2, 3)
+) -> pl.DataFrame:
+    """Residual-leak table per (axis, k_hop) for one split.
+
+    Returns DataFrame (axis, k_hop, n_test, n_leak, pct_leak). Always has
+    the same schema even when test=0 so per-corpus concat is safe.
+    """
+    _, all_edges = load_canonical_kg(kg_dir)
     train_ids = split.filter(pl.col("fold") == "train").select("node_id")
     test_ids = split.filter(pl.col("fold") == "test").select("node_id")
     rows: list[dict] = []
     if not train_ids.height or not test_ids.height:
-        # Emit one row per k_hop with n_test=0 so the schema is stable.
-        for k in k_hops:
-            rows.append({"k_hop": k, "n_test": int(test_ids.height),
-                         "n_leak": 0, "pct_leak": float("nan")})
+        for axis in _AXIS_EDGE_SETS:
+            for k in k_hops:
+                rows.append({"axis": axis, "k_hop": k,
+                             "n_test": int(test_ids.height),
+                             "n_leak": 0, "pct_leak": float("nan")})
         return pl.DataFrame(rows)
     max_h = max(k_hops)
-    reached = bfs_distance(train_ids, leak_edges, max_hop=max_h)
-    test_hop = test_ids.join(reached, on="node_id", how="left")
-    for k in k_hops:
-        n_leak = int(test_hop.filter(
-            pl.col("hop").is_not_null() & (pl.col("hop") <= k)
-        ).height)
-        rows.append({"k_hop": k, "n_test": test_ids.height,
-                     "n_leak": n_leak, "pct_leak": 100 * n_leak / test_ids.height})
+    for axis, etypes in _AXIS_EDGE_SETS.items():
+        sub = all_edges.filter(pl.col("edge_type").is_in(list(etypes))).select(["src", "dst"])
+        if not sub.height:
+            for k in k_hops:
+                rows.append({"axis": axis, "k_hop": k, "n_test": test_ids.height,
+                             "n_leak": 0, "pct_leak": 0.0})
+            continue
+        reached = bfs_distance(train_ids, sub, max_hop=max_h)
+        test_hop = test_ids.join(reached, on="node_id", how="left")
+        for k in k_hops:
+            n_leak = int(test_hop.filter(
+                pl.col("hop").is_not_null() & (pl.col("hop") <= k)
+            ).height)
+            rows.append({"axis": axis, "k_hop": k, "n_test": test_ids.height,
+                         "n_leak": n_leak, "pct_leak": 100 * n_leak / test_ids.height})
     return pl.DataFrame(rows)
 
 
@@ -286,12 +321,16 @@ def run(args: argparse.Namespace) -> None:
     summary = pl.concat(summary_rows, how="vertical_relaxed")
     summary_path = out / f"leak_residual__{args.corpus}.csv"
     summary.write_csv(summary_path)
-    (out / f"report__{args.corpus}.md").write_text(
-        f"# Mảng C — split head-to-head ({args.corpus})\n\n"
-        + summary.pivot(index="protocol", on="k_hop", values="pct_leak")
-                 .to_pandas().to_markdown() + "\n",
-        encoding="utf-8",
-    )
+    # Per-axis pivot: rows = protocol, cols = k_hop, separate table per axis.
+    md_lines = [f"# Mảng C — split head-to-head ({args.corpus})\n"]
+    for axis in _AXIS_EDGE_SETS:
+        sub = summary.filter(pl.col("axis") == axis)
+        if not sub.height:
+            continue
+        pivot = sub.pivot(index="protocol", on="k_hop", values="pct_leak")
+        md_lines.append(f"\n## axis = {axis}\n")
+        md_lines.append(pivot.to_pandas().round(1).to_markdown())
+    (out / f"report__{args.corpus}.md").write_text("\n".join(md_lines), encoding="utf-8")
 
 
 def _cli() -> None:
