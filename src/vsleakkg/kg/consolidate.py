@@ -351,6 +351,8 @@ def _wire_reference_provenance(
     n_synth_pub = n_synth_assay = n_synth_prot = 0
 
     # ---- ChEMBL chain ----
+    # Build the chain in *aggregated* steps so we never materialise the full
+    # Cartesian explosion. Each pair set is deduped before the next join.
     bench_to_chembl = (raw_edges.filter(
             pl.col("edge_type") == "benchmark_ligand_same_inchikey_as_chembl_ligand")
         .select([pl.col("src").alias("bench_lid"),
@@ -362,17 +364,26 @@ def _wire_reference_provenance(
             .select([pl.col("dst").alias("chembl_lid"),
                      pl.col("src").alias("chembl_act_id")])
             .unique())
-        # Activity -> Document
+        log.info("  chembl chain: %d bench->chembl_lig, %d chembl_lig->act",
+                 bench_to_chembl.height, chembl_lig_to_act.height)
+
+        # Activity -> Document, deduped first to drop redundant pairs.
         act_doc = (raw_edges.filter(
                 pl.col("edge_type") == "chembl_activity_has_document")
             .select([pl.col("src").alias("chembl_act_id"),
                      pl.col("dst").alias("chembl_doc_id")])
             .unique())
         if act_doc.height:
+            chembl_lig_to_doc = (chembl_lig_to_act
+                                 .join(act_doc, on="chembl_act_id", how="inner")
+                                 .select(["chembl_lid", "chembl_doc_id"]).unique())
+            bench_to_doc = (bench_to_chembl
+                            .join(chembl_lig_to_doc, on="chembl_lid", how="inner")
+                            .select(["bench_lid", "chembl_doc_id"]).unique())
+            log.info("  chembl: %d unique chembl_lig->doc, %d bench->doc",
+                     chembl_lig_to_doc.height, bench_to_doc.height)
             ex_to_doc = (ex_lig
-                         .join(bench_to_chembl, on="bench_lid", how="inner")
-                         .join(chembl_lig_to_act, on="chembl_lid", how="inner")
-                         .join(act_doc, on="chembl_act_id", how="inner")
+                         .join(bench_to_doc, on="bench_lid", how="inner")
                          .select([pl.col("example_id").alias("src"),
                                   pl.col("chembl_doc_id").alias("dst")])
                          .unique())
@@ -384,17 +395,23 @@ def _wire_reference_provenance(
                                         how="vertical_relaxed")
             n_synth_pub += ex_to_doc.height
 
-        # Activity -> Assay
+        # Activity -> Assay, same aggregated pattern.
         act_asy = (raw_edges.filter(
                 pl.col("edge_type") == "chembl_activity_has_assay")
             .select([pl.col("src").alias("chembl_act_id"),
                      pl.col("dst").alias("chembl_asy_id")])
             .unique())
         if act_asy.height:
+            chembl_lig_to_asy = (chembl_lig_to_act
+                                 .join(act_asy, on="chembl_act_id", how="inner")
+                                 .select(["chembl_lid", "chembl_asy_id"]).unique())
+            bench_to_asy = (bench_to_chembl
+                            .join(chembl_lig_to_asy, on="chembl_lid", how="inner")
+                            .select(["bench_lid", "chembl_asy_id"]).unique())
+            log.info("  chembl: %d unique chembl_lig->asy, %d bench->asy",
+                     chembl_lig_to_asy.height, bench_to_asy.height)
             ex_to_asy = (ex_lig
-                         .join(bench_to_chembl, on="bench_lid", how="inner")
-                         .join(chembl_lig_to_act, on="chembl_lid", how="inner")
-                         .join(act_asy, on="chembl_act_id", how="inner")
+                         .join(bench_to_asy, on="bench_lid", how="inner")
                          .select([pl.col("example_id").alias("src"),
                                   pl.col("chembl_asy_id").alias("dst")])
                          .unique())
