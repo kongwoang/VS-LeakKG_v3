@@ -497,3 +497,66 @@ across 2, 6.7K across 3, 274 across 4, 14 across all 5 corpora.
 - ligand_similar dedup: 0.1s (-141 dups)
 - write parquet: 5.8s
 - **total: 37.9s** for 38.9M-edge canonical KG
+
+## Phase 6.1 — protein-id collapse + sorted-pair ligand_similar (2026-05-31 02:58)
+
+Final post-Phase-6 audit (`.tmp/full_audit{,2}.py`) surfaced two anomalies:
+
+**Issue A — Protein axis split across `tgt:Corpus:UniProtID` and `protein:UniProtID`.**
+The per-corpus loaders prefix Protein nodes with `tgt:<Corpus>:` even when
+the corpus provides a clean UniProt accession (mainly BigBind), while the
+BindingDB wire and protein-cluster code use the canonical `protein:<UniProt>`
+form. 1,056 BigBind UniProts existed as both a `tgt:BigBind:X` and a
+`protein:X` node — same protein, two synonymous entities, edges split
+between them. Smaller leaks: 25 BayesBind. (DUD-E / DEKOIS / LIT-PCBA
+use gene symbols, not UniProt, so are correctly left alone.)
+
+**Issue B — `ligand_similar` had 240 edges in both directions.**
+The upstream similarity job emits unordered pairs without enforcing
+src<dst, so 120 pairs landed twice. Sibling edge types
+(`ligand_exact`, `ligand_parent_exact`, `ligand_fingerprint_exact`)
+already use sorted-pair convention.
+
+### Fix
+
+- New `_normalize_protein_ids()` in `consolidate.py` detects node_ids
+  matching `^tgt:[^:]+:<UniProtRegex>$` and rewrites them to
+  `protein:<UniProtRegex>`, then dedups Protein nodes by id and
+  rewrites edge src/dst with the same mapping. UniProt regex covers
+  both 6-char (`[OPQ]\d[A-Z0-9]{3}\d` / `[A-NR-Z]\d[A-Z][A-Z0-9]{2}\d`)
+  and 10-char extended forms.
+- `ligand_similar` dedup block now forces
+  `(src, dst) := (min(src,dst), max(src,dst))` before
+  `unique(subset=[src,dst])`.
+- Added targeted dedup on `example_has_protein` (protein-id collapse can
+  produce duplicates when the BindingDB wire and the corpus loader both
+  reach the same UniProt — 292,885 such edges removed).
+
+### Final canonical KG (Phase 6.1)
+
+| Metric | Phase 6 | Phase 6.1 | Δ |
+|---|---:|---:|---:|
+| Nodes | 7,951,307 | **7,950,451** | −856 (protein collapse net) |
+| Edges | 38,888,212 | **38,595,558** | −292,654 (EHP dedup) |
+| Protein nodes | 6,764 | **5,683** | −1,081 (1,198 tgt: → protein: collapsed, +117 new `protein:`) |
+| `tgt:`-prefixed Protein | 1,421 | 223 | gene-symbol-only ids correctly retained |
+| `protein_in_cluster` edges | 13,506 | **13,857** | +351 (cluster edges now match newly-collapsed proteins) |
+| `example_has_protein` | 8,221,977 | **7,929,092** | −292,885 dedup |
+| `ligand_similar` | 448,829 | **448,709** | −120 (bidir dups removed) |
+| Hub-flagged | 407 | 407 | unchanged |
+
+### Verification (post-Phase-6.1)
+
+- duplicate node_id (full pass): 0
+- node_id type-prefix collisions: 0
+- dangling src/dst: 0 / 0
+- duplicate (src, dst, edge_type): 0
+- self-loops: 0
+- props JSON validity (1000 sample, nodes + edges): 0 parse fail
+- stats.csv vs actual counts: 0 mismatch
+- `ligand_similar` bidirectional edges: **0** (was 240)
+- Protein `protein:UniProt` ↔ `tgt:Corpus:UniProt` overlap: **0** (was 1,056)
+- All Protein nodes reachable via `example_has_protein`: 100%
+
+Total runtime: 44.5s (+6.6s vs Phase 6 — the extra cost is the protein-id
+join + the two new dedup passes; well under the 60-min memory horizon).
