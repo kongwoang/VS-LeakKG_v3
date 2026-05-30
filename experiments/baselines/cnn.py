@@ -53,10 +53,17 @@ _LEAK_EDGE_TYPES: tuple[str, ...] = (
 def cnn_score(
     split: pl.DataFrame, kg_dir: Path, k_hop: int = 2, default_score: float = 0.5
 ) -> pl.DataFrame:
-    """Return predictions with `score = mean(train_label within k hops)`.
+    """Predict each test's score as the mean label of train items within
+    k_hop on the leak subgraph.
 
-    Items that have no train neighbour within k_hop receive `default_score`
-    (the corpus prior). Per-row schema matches PredictionSchema.
+    Implementation notes:
+      - We don't materialise a symmetrised 2x edges frame — that blew up
+        OOM on 38M edges. Instead, we look up neighbours via forward and
+        reverse joins separately and concat.
+      - For k_hop ≥ 2 we expand via a per-hop frontier (similar to
+        bfs_distance) but propagate train labels along, capping each test
+        to its nearest reached train hop so the average isn't dominated
+        by distant noisy labels.
     """
     _, edges = load_canonical_kg(kg_dir)
     leak = edges.filter(pl.col("edge_type").is_in(list(_LEAK_EDGE_TYPES))).select(
@@ -68,68 +75,95 @@ def cnn_score(
     enriched = split.rename({"node_id": "example_id"}).join(
         examples, on="example_id", how="inner"
     )
-    train_ids = enriched.filter(pl.col("fold") == "train").select(
-        pl.col("example_id").alias("node_id"), pl.col("label").alias("train_label")
-    )
+    train_ids = (enriched.filter(pl.col("fold") == "train")
+                 .select(pl.col("example_id"),
+                         pl.col("label").alias("train_label")))
     if not train_ids.height:
         raise SystemExit("split has 0 train rows")
-    # BFS from every train seed; carry their label along so we can average.
-    reached = bfs_distance(
-        train_ids.select("node_id"), leak, max_hop=k_hop
-    ).rename({"hop": "min_hop"})
-    # For each reached node, collect labels of the train items it could have
-    # been reached from. This requires a per-train BFS in the general case;
-    # we approximate it by averaging labels of train items reachable from
-    # the *reached* node (BFS is symmetric on this undirected subgraph).
-    reached_with_label = reached.join(train_ids, on="node_id", how="left")
-    # The reverse: for each test node, find the train neighbours via the
-    # symmetric edge set.
-    # Build (test_node_id, [train_label]) by running BFS rooted at train
-    # and grouping by which train was the seed — too expensive to do
-    # per-seed for 5M train items, so use the heuristic that "if the
-    # reached node is itself labelled in train, use its label; otherwise
-    # join the symmetric edge once and pull adjacent train labels".
-    e_sym = pl.concat([
-        leak.select(["src", "dst"]),
-        leak.select([pl.col("dst").alias("src"), pl.col("src").alias("dst")]),
-    ], how="vertical_relaxed").unique()
     test_ids = enriched.filter(pl.col("fold") == "test").select("example_id")
-    # For each test, look at all direct neighbours that are labelled in
-    # train, and take the mean. This is a 1-hop variant of C-NN. For 2-hop,
-    # repeat through one more join.
-    train_label_map = train_ids
-    test_to_nbr = (
-        e_sym.join(test_ids.rename({"example_id": "src"}), on="src", how="semi")
-             .select([pl.col("src").alias("example_id"), pl.col("dst").alias("nbr")])
-    )
+    print(f"train={train_ids.height:,}, test={test_ids.height:,}", flush=True)
+
+    # ---- k=1: direct neighbours via fwd + bwd joins (no symmetrise) ----
+    # forward: edges where src is a test, dst is a train
+    fwd = (leak.join(test_ids.rename({"example_id": "src"}), on="src", how="semi")
+               .rename({"src": "test_id", "dst": "nbr"})
+               .join(train_ids.rename({"example_id": "nbr",
+                                       "train_label": "tl"}),
+                     on="nbr", how="inner")
+               .select(["test_id", "tl"]))
+    bwd = (leak.join(test_ids.rename({"example_id": "dst"}), on="dst", how="semi")
+               .rename({"dst": "test_id", "src": "nbr"})
+               .join(train_ids.rename({"example_id": "nbr",
+                                       "train_label": "tl"}),
+                     on="nbr", how="inner")
+               .select(["test_id", "tl"]))
+    one_hop = pl.concat([fwd, bwd], how="vertical_relaxed").unique()
+    print(f"  1-hop test→train edges: {one_hop.height:,}", flush=True)
+
+    score_parts = [one_hop.with_columns(pl.lit(1, dtype=pl.Int64).alias("hop"))]
     if k_hop >= 2:
-        # second hop: nbr -> 2-hop neighbours
-        nbr2 = (
-            e_sym.join(test_to_nbr.select(pl.col("nbr").alias("src")),
-                       on="src", how="semi")
-                 .select([pl.col("src").alias("nbr"), pl.col("dst").alias("nbr2")])
-        )
-        test_to_2hop = test_to_nbr.join(nbr2, on="nbr", how="inner").select([
-            "example_id", pl.col("nbr2").alias("nbr"),
-        ])
-        test_to_nbr = pl.concat([test_to_nbr, test_to_2hop],
-                                how="vertical_relaxed").unique()
-    # Lookup train labels.
-    train_label_lookup = train_label_map.rename({"node_id": "nbr"})
-    test_nbr_label = test_to_nbr.join(train_label_lookup, on="nbr", how="inner")
-    test_score = (
-        test_nbr_label.group_by("example_id")
-        .agg(pl.col("train_label").mean().alias("score"))
+        # 2-hop: find all (test_id, intermediate) edges, then (intermediate, train_id)
+        inter_fwd = (leak.join(test_ids.rename({"example_id": "src"}),
+                               on="src", how="semi")
+                         .rename({"src": "test_id", "dst": "mid"}))
+        inter_bwd = (leak.join(test_ids.rename({"example_id": "dst"}),
+                               on="dst", how="semi")
+                         .rename({"dst": "test_id", "src": "mid"}))
+        inter = pl.concat([inter_fwd, inter_bwd], how="vertical_relaxed").unique()
+        # Remove intermediates that are themselves train (we already have
+        # those via 1-hop).
+        inter = inter.join(train_ids.rename({"example_id": "mid"}),
+                           on="mid", how="anti")
+        print(f"  2-hop intermediates: {inter.height:,}", flush=True)
+
+        # From intermediate to train (any direction).
+        mid_to_train_fwd = (leak.join(inter.select("mid").unique()
+                                          .rename({"mid": "src"}),
+                                       on="src", how="semi")
+                                .rename({"src": "mid", "dst": "nbr"})
+                                .join(train_ids.rename({"example_id": "nbr",
+                                                        "train_label": "tl"}),
+                                      on="nbr", how="inner")
+                                .select(["mid", "tl"]))
+        mid_to_train_bwd = (leak.join(inter.select("mid").unique()
+                                          .rename({"mid": "dst"}),
+                                       on="dst", how="semi")
+                                .rename({"dst": "mid", "src": "nbr"})
+                                .join(train_ids.rename({"example_id": "nbr",
+                                                        "train_label": "tl"}),
+                                      on="nbr", how="inner")
+                                .select(["mid", "tl"]))
+        mid_to_train = pl.concat([mid_to_train_fwd, mid_to_train_bwd],
+                                 how="vertical_relaxed").unique()
+        two_hop = (inter.join(mid_to_train, on="mid", how="inner")
+                        .select(["test_id", "tl"])
+                        .with_columns(pl.lit(2, dtype=pl.Int64).alias("hop")))
+        print(f"  2-hop test→train edges: {two_hop.height:,}", flush=True)
+        score_parts.append(two_hop)
+
+    all_hops = pl.concat(score_parts, how="vertical_relaxed")
+    # For each test, take the AVERAGE label only over its nearest-hop
+    # train neighbours (avoids distant noise overwhelming close signal).
+    nearest = (all_hops.group_by("test_id").agg(pl.col("hop").min().alias("min_hop")))
+    nearest_score = (
+        all_hops.join(nearest, on="test_id", how="inner")
+                .filter(pl.col("hop") == pl.col("min_hop"))
+                .group_by("test_id")
+                .agg(pl.col("tl").mean().alias("score"))
+                .rename({"test_id": "example_id"})
     )
-    # Train rows get score = own label (perfect by construction). Test rows
-    # get the computed score; unreached test items get default_score.
-    train_self_score = train_ids.rename({"node_id": "example_id", "train_label": "score"})
+
+    # Train rows get score = own label (perfect by construction).
+    train_self_score = train_ids.select([
+        pl.col("example_id"), pl.col("train_label").alias("score")
+    ])
     full_score = (
         enriched.join(
-            pl.concat([train_self_score, test_score], how="vertical_relaxed"),
+            pl.concat([train_self_score, nearest_score],
+                      how="vertical_relaxed"),
             on="example_id", how="left",
         )
-        .with_columns(pl.col("score").fill_null(default_score))
+        .with_columns(pl.col("score").cast(pl.Float64).fill_null(default_score))
     )
     return full_score.select(["example_id", "score", "label", "fold"])
 
