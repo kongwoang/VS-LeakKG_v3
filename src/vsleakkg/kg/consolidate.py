@@ -396,11 +396,11 @@ def _wire_reference_provenance(
             n_synth_pub += ex_to_doc.height
 
         # Activity -> Assay, same aggregated pattern. The full join produces
-        # ~57M Example->Assay pairs which is enough to OOM a 96 GB box once
-        # combined with the dangling-prune frame. Cap each benchmark Ligand
-        # to at most _ASSAY_CAP_PER_LIG distinct Assays (keeps the
-        # quantitative-assay audit signal, drops promiscuous HTS noise).
-        _ASSAY_CAP_PER_LIG = 20
+        # ~57M Example->Assay pairs which is enough to OOM the consolidator.
+        # Cap each benchmark Ligand to its top-_ASSAY_CAP_PER_LIG distinct
+        # ChEMBL Assays (keeps the quantitative-assay audit signal, drops
+        # promiscuous HTS noise).
+        _ASSAY_CAP_PER_LIG = 5
         act_asy = (raw_edges.filter(
                 pl.col("edge_type") == "chembl_activity_has_assay")
             .select([pl.col("src").alias("chembl_act_id"),
@@ -484,26 +484,13 @@ def _wire_reference_provenance(
                                         how="vertical_relaxed")
             n_synth_prot += ex_to_bdb_prot.height
 
-        # bdb_lig -> BindingDB record (Assay-like)
-        bdb_rec = (raw_edges.filter(
-                pl.col("edge_type") == "bindingdb_record_has_ligand")
-            .select([pl.col("dst").alias("bdb_lid"),
-                     pl.col("src").alias("bdb_rec_id")])
-            .unique())
-        if bdb_rec.height:
-            ex_to_bdb_rec = (ex_lig
-                             .join(bench_to_bdb, on="bench_lid", how="inner")
-                             .join(bdb_rec, on="bdb_lid", how="inner")
-                             .select([pl.col("example_id").alias("src"),
-                                      pl.col("bdb_rec_id").alias("dst")])
-                             .unique())
-            ex_to_bdb_rec = ex_to_bdb_rec.with_columns([
-                pl.lit(EdgeType.EXAMPLE_FROM_ASSAY.value).alias("edge_type"),
-                pl.lit(_json.dumps({"source": "BindingDB"})).alias("props"),
-            ])
-            canonical_edges = pl.concat([canonical_edges, ex_to_bdb_rec],
-                                        how="vertical_relaxed")
-            n_synth_assay += ex_to_bdb_rec.height
+        # BindingDB record-as-Assay was attempted but produces a 785K
+        # bdb_rec node set of which ~66 % (518K) are orphan after wiring —
+        # they're activities on BindingDB ligands that no benchmark Example
+        # references. The remaining signal duplicates the ChEMBL Assay axis
+        # (BindingDB record's source paper is in BindingDB's Publication
+        # axis already), so we skip this edge type to keep the canonical
+        # KG focused.
 
     log.info("wire_ref_provenance: synth %d publication + %d assay + %d protein edges",
              n_synth_pub, n_synth_assay, n_synth_prot)
