@@ -394,6 +394,17 @@ def consolidate(
     stats.n_hub_nodes_sharded = n_hubs
     log.info("flagged %d hub nodes", n_hubs)
 
+    # Prune dangling edges (cluster edges typically dangle when corpus-level
+    # Protein ids don't match the UniProt-based cluster member ids).
+    _ids = nodes.select("node_id")
+    n_before = edges.height
+    edges = (edges.join(_ids.rename({"node_id": "src"}), on="src", how="semi")
+                  .join(_ids.rename({"node_id": "dst"}), on="dst", how="semi"))
+    pruned = n_before - edges.height
+    if pruned:
+        log.info("pruned %d dangling edges", pruned)
+        stats.deferred = (stats.deferred or []) + [f"pruned_dangling_edges={pruned}"]
+
     # Already eager DataFrames at this point.
     nodes_df = nodes
     edges_df = edges
