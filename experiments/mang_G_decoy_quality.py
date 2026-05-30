@@ -89,22 +89,51 @@ def run(args: argparse.Namespace) -> None:
     )
     print(f"decoy (id,lig,target): {decoy_pairs.height:,}", flush=True)
 
-    # The join: for each decoy, look up actives sharing the same ligand
-    # but a DIFFERENT target. Pre-aggregating actives per ligand keeps the
-    # join from exploding (a ligand active on N targets joins N times, not
-    # N × #decoys-with-same-lig as the naive cross-product would).
-    decoy_join = (
-        decoy_pairs.join(active_lig_target, on="lig", how="inner")
-        .filter(pl.col("active_target") != pl.col("decoy_target"))
-    )
-    print(f"decoy×active intersect (diff target): {decoy_join.height:,}", flush=True)
+    # Memory-efficient version: dedup to UNIQUE (lig, decoy_target) pairs
+    # before joining with actives. Then map back to decoy_id at the end.
+    #
+    # If 5.47M decoy rows reduce to ~1.4M unique (lig, target) pairs and
+    # active_lig_target is ~820K, the join output is bounded by the number
+    # of distinct (lig, decoy_target, active_target) triples — typically a
+    # few million, not the cross-product.
+    dl_t = decoy_pairs.select(["lig", "decoy_target"]).unique()
+    print(f"unique (lig, decoy_target) pairs: {dl_t.height:,}", flush=True)
 
-    per_decoy = (decoy_join.group_by(["decoy_id", "decoy_source", "decoy_target"])
-                 .agg([
-                     pl.col("active_target").n_unique().alias("n_other_targets"),
-                     pl.col("active_target").first().alias("sample_other_target"),
-                     pl.col("active_source").first().alias("sample_other_source"),
-                 ]))
+    # Aggregate active_lig_target per ligand so the join fans out by
+    # (number of OTHER targets per ligand) rather than per (decoy_id, lig).
+    active_per_lig = (
+        active_lig_target.group_by("lig").agg([
+            pl.col("active_target").alias("active_targets"),
+            pl.col("active_source").first().alias("sample_active_source"),
+        ])
+    )
+
+    dirty_pairs = (
+        dl_t.join(active_per_lig, on="lig", how="inner")
+        .with_columns(
+            # remove the decoy's own target from the list of "other" targets
+            pl.col("active_targets").list.set_difference(
+                pl.col("decoy_target").reshape((-1, 1)).cast(pl.List(pl.Utf8))
+            ).alias("other_targets")
+        )
+        .with_columns(pl.col("other_targets").list.len().alias("n_other_targets"))
+        .filter(pl.col("n_other_targets") > 0)
+        .select([
+            "lig", "decoy_target", "n_other_targets",
+            pl.col("other_targets").list.first().alias("sample_other_target"),
+            "sample_active_source",
+        ])
+    )
+    print(f"dirty (lig, decoy_target) pairs: {dirty_pairs.height:,}", flush=True)
+
+    per_decoy = (
+        decoy_pairs.join(dirty_pairs, on=["lig", "decoy_target"], how="inner")
+        .select([
+            "decoy_id", "decoy_source", "decoy_target",
+            "n_other_targets", "sample_other_target",
+            pl.col("sample_active_source").alias("sample_other_source"),
+        ])
+    )
     # Rename for output compatibility.
     per_decoy = per_decoy.rename({"decoy_source": "source", "decoy_target": "target"})
     decoys = examples.filter(pl.col("label") == 0)  # for summary count
