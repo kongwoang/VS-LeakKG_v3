@@ -225,7 +225,12 @@ _PROTOCOLS: dict[str, Callable] = {
 def measure_residual_leak(
     split: pl.DataFrame, kg_dir: Path, k_hops: tuple[int, ...] = (1, 2, 3)
 ) -> pl.DataFrame:
-    """% of test items reachable from train within k hops on the leak subgraph."""
+    """% of test items reachable from train within k hops on the leak subgraph.
+
+    Always returns a frame with the same (k_hop, n_test, n_leak, pct_leak)
+    schema, even when the protocol collapsed test to 0 — that's itself a
+    meaningful outcome (every test was deemed contaminated).
+    """
     _, all_edges = load_canonical_kg(kg_dir)
     leak_edges = all_edges.filter(pl.col("edge_type").is_in([
         "example_has_ligand", "example_has_protein",
@@ -235,8 +240,12 @@ def measure_residual_leak(
     ])).select(["src", "dst"])
     train_ids = split.filter(pl.col("fold") == "train").select("node_id")
     test_ids = split.filter(pl.col("fold") == "test").select("node_id")
-    rows = []
+    rows: list[dict] = []
     if not train_ids.height or not test_ids.height:
+        # Emit one row per k_hop with n_test=0 so the schema is stable.
+        for k in k_hops:
+            rows.append({"k_hop": k, "n_test": int(test_ids.height),
+                         "n_leak": 0, "pct_leak": float("nan")})
         return pl.DataFrame(rows)
     max_h = max(k_hops)
     reached = bfs_distance(train_ids, leak_edges, max_hop=max_h)
