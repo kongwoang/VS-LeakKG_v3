@@ -158,13 +158,17 @@ def main() -> int:
                   .select(["src", "dst"])
                   .rename({"src": "example_id", "dst": "source_id"}))
         joined = ex_lig.join(ex_prot, on="example_id", how="inner").join(ex_src, on="example_id", how="inner")
-        ghost = joined.group_by(["source_id", "target_id", "ligand_id"]).len().filter(pl.col("len") > 1)
+        ghost = (joined.group_by(["source_id", "target_id", "ligand_id"]).len()
+                 .rename({"len": "n_examples"})
+                 .filter(pl.col("n_examples") > 1))
         out_lines.append(f"- Triples (source, target, ligand) with >1 Example: **{ghost.height:,}**\n")
         if ghost.height:
-            by_n = ghost.group_by("len").len().sort("len", descending=True)
+            by_n = (ghost.group_by("n_examples").len()
+                    .rename({"len": "n_triples"})
+                    .sort("n_examples", descending=True))
             out_lines.append("- Distribution of duplication count:\n")
             for r in by_n.head(5).iter_rows(named=True):
-                out_lines.append(f"  - {r['len']} Examples per (s,t,l): {r['len']:,} triples\n")
+                out_lines.append(f"  - {r['n_examples']} Examples per (s,t,l): {r['n_triples']:,} triples\n")
 
     # ---------- Final node integrity ----------
     log.info("Final node/edge integrity sanity")
