@@ -79,6 +79,97 @@ Root cause guess: polars iter_rows(named=True) on >5M-row DataFrames may return 
 
 ---
 
+## Phase A-E (2026-05-30 13:30 onwards) — feature complete
+
+### Renames (commit 61ef274)
+- `src/vsleakkg/v2/` → `src/vsleakkg/kg/` (canonical KG schema layer)
+- `v2/build_graph.py` → `kg/consolidate.py` (function `build_graph()` → `consolidate()`)
+- `V1_TO_V2_NODE_TYPE` → `CORPUS_TO_CANONICAL_NODE_TYPE` (and EDGE_TYPE)
+- `V1_DROPPED_*` → `DROPPED_*`
+- `v2_nodes/v2_edges.parquet` → `canonical_nodes/canonical_edges.parquet`
+- `outputs/v2/graph/` → `outputs/kg/`
+- `VSLEAKKG_V1_ROOT` env → `VSLEAKKG_ROOT`
+- All "v1 / v2 / mvp" wording stripped from docstrings.
+
+### A1 + A6: salt-strip parent edge + build-time invariants
+- `chem.parent_inchikey`: RDKit SaltRemover → InChIKey of parent. `task_build_kg`
+  emits `same_parent_inchikey_as` edges bridging salt/protonation variants
+  (in this dataset, no salts were found — 6,939 edges, same as
+  `same_inchikey_as`). EdgeType `LIGAND_PARENT_EXACT` added (weight 0.95).
+- `task_build_kg` raises on any of: duplicate node_id after dedup, node_id
+  missing `:` prefix, dangling edges. Catches the iter_rows regression at
+  write time.
+
+### A3: BayesBind wired
+- `load_bayesbind.build()`: parses per-target actives.csv + random.csv,
+  uses shared `make_nodes_edges`. 261K examples, 21K ligands, 25 targets.
+- BayesBind also mapped 99.98% to ChEMBL (confirms BayesBind ⊂ ChEMBL).
+
+### A4: BindingDB enrichment
+- `task_build_kg` reads `bindingdb_records_minimal.parquet` for every
+  mapped BindingDB ligand and emits Publication (PMID/DOI), Protein
+  (UniProt), and Assay-like (record_id) nodes. ~26K Publications,
+  ~5K Proteins, ~785K Assays added.
+
+### A* parallel featurize
+- `chem.featurize_batch_parallel` / `chem.parent_inchikey_batch_parallel`:
+  order-preserving multiprocessing with index-alignment sanity checks.
+- Empirical speedup on VUW (32 cores):
+
+  | step | sequential | parallel | speedup |
+  |---|---:|---:|---:|
+  | BigBind featurize 583K | 14 min | (cached) | n/a |
+  | BayesBind featurize 261K | ~6 min | **29.6 s** | 12× |
+  | parent_inchikey 2.01M | ~17 min | **2 min 13 s** | 7.7× |
+
+### B2: protein clustering rebuilt
+- `load_chembl_db.load_target_sequences`: joins target_dictionary →
+  target_components → component_sequences for every protein-type
+  component with non-null sequence.
+- `build_protein_clusters` orchestrator: extracts 4,696 unique ChEMBL
+  sequences, writes FASTA, runs `mmseqs easy-cluster` at 30/50/90 %
+  identity, converts each `*_cluster.tsv` to
+  `protein_clusters_{30,50,90}.parquet` (schema: accession, cluster_id,
+  resolution). MMseqs2 itself uses all 32 cores natively.
+- `kg.consolidate` reads the new parquets, prefixes accessions with
+  `protein:` to match the KG Protein ID format, then prunes any edges
+  whose src lacks a matching Protein node. Net result: 13,506 valid
+  `protein_in_cluster` edges, 19,171 ProteinCluster nodes.
+
+### D5: exact pairwise ligand similarity
+- `ligand_similarity.py`: ECFP4 fingerprints via parallel pool, sort by
+  popcount, bit-bound pruning via the Swamidass-Baldi inequality
+  (`Tanimoto(A,B) ≤ min(|A|,|B|)/max(|A|,|B|)`), per-window
+  `BulkTanimotoSimilarity`.
+- Fingerprint phase: 2.01M ligands → 49.2 s on 32 cores.
+- Pairwise phase: ~30 min wall clock for threshold = 0.70.
+- Emits each pair with `src < dst` so `unique()` collapses duplicates.
+
+### Final canonical KG (post Phase A-E rebuild)
+
+| Metric | Value |
+|---|---:|
+| Raw kg | 17.74M nodes / 64.58M edges |
+| Canonical KG | **8.63M nodes / 18.83M edges** |
+| Example | 5,025,497 (+260K BayesBind) |
+| Ligand | 2,013,247 |
+| Scaffold | 645,558 |
+| Assay | 857,115 |
+| Publication | 66,653 |
+| Protein | 6,764 (vs 1,371 before — +5,343 from BindingDB UniProt) |
+| ProteinCluster | 19,171 (NEW) |
+| `ligand_exact` | 6,939 |
+| `ligand_parent_exact` | 6,939 (NEW) |
+| `ligand_similar` (Tanimoto ≥ 0.70) | TBD (D5 in progress) |
+| `protein_in_cluster` | 13,506 (NEW) |
+
+### Tests
+- `tests/test_chem.py`: 10 unit tests for canonical SMILES / InChIKey /
+  scaffold determinism, salt-strip parent equivalence, and parallel batch
+  order preservation. All pass on current pinned RDKit version.
+
+---
+
 ## Rebuild from scratch — 2026-05-30 13:05
 
 User instruction: drop pocket axis fully + rebuild clean KG from v3, keep nothing from v2, run merge integrity audit.
