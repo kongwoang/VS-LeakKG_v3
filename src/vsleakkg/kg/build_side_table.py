@@ -2,7 +2,7 @@
 
 The side-table is the bridge between v2 split parquets (`(example_id,
 partition)`) and the downstream model adapters (SPRINT, DrugCLIP,
-LigUnity). It produces one parquet matching `vsleakkg.v2.hydrate.SIDE_TABLE_SCHEMA`:
+LigUnity). It produces one parquet matching `vsleakkg.kg.hydrate.SIDE_TABLE_SCHEMA`:
 
     example_id, source, source_id,
     smiles, smiles_canonical, inchikey,
@@ -26,7 +26,7 @@ flags the row as needing a foldseek run).
 
 CLI:
 
-    python -m vsleakkg.v2.build_side_table \
+    python -m vsleakkg.kg.build_side_table \
         --output /vol/.../VS-LeakKG_v2/outputs/v2/graph/side_table.parquet \
         [--sources chembl,bindingdb,pdbbind,litpcba,dude,dekois,bayesbind]
         [--limit 100000]

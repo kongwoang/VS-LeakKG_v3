@@ -9,14 +9,14 @@ example_in_trainset_m edge per training row. Per proposal section 5.6:
 This module accepts a model manifest (a parquet/CSV listing the training
 identifiers) and produces:
   - one TrainSet_m node
-  - example_in_trainset edges into the v2 graph
+  - example_in_trainset edges into the canonical KG
 
 Manifest formats supported:
   - parquet with columns (model, example_id) or (model, source, identifier)
   - CSV with the same columns
 
 If a manifest lists external IDs (e.g. BindingDB row IDs) that don't yet
-correspond to Example nodes in the v2 graph, we attempt to resolve them via
+correspond to Example nodes in the canonical KG, we attempt to resolve them via
 an id_map DataFrame keyed by (source, identifier) -> example_id. Unresolved
 rows are returned as a separate dataframe and not silently dropped.
 """
@@ -46,7 +46,7 @@ def ingest_model_trainset(
     model_id: str,
     id_map: pl.DataFrame | None = None,
 ) -> dict[str, pl.DataFrame]:
-    """Convert a model training manifest into v2 graph nodes/edges.
+    """Convert a model training manifest into canonical KG nodes/edges.
 
     Args:
         manifest_path: parquet/CSV listing training rows. Must contain a
@@ -108,7 +108,7 @@ def merge_into_graph(
     graph_edges: pl.DataFrame,
     trainset: dict[str, pl.DataFrame],
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Append TrainSet nodes/edges to an existing v2 graph.
+    """Append TrainSet nodes/edges to an existing canonical KG.
 
     Idempotent: if the TrainSet node is already present (same node_id), the
     existing entry is preserved and only new edges are appended. Duplicate

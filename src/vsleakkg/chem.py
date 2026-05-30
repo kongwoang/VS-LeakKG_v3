@@ -8,8 +8,10 @@ from typing import Iterable, List, Optional, Sequence
 
 import numpy as np
 from rdkit import Chem, DataStructs, RDLogger
-from rdkit.Chem import AllChem
+from rdkit.Chem import AllChem, SaltRemover
 from rdkit.Chem.Scaffolds import MurckoScaffold
+
+_SALT_REMOVER = SaltRemover.SaltRemover()
 
 # RDKit emits warnings for sub-MOL2 parse failures and odd valences. Silence them
 # for batch processing; callers that need to inspect individual molecules can
@@ -110,6 +112,103 @@ def featurize(smi: str) -> MolFeatures:
     except Exception:
         scaf = None
     return MolFeatures(smi, can, ik, scaf, True)
+
+
+def featurize_batch_parallel(smiles: list[str], n_workers: Optional[int] = None,
+                              chunksize: int = 1000,
+                              log: Optional["logging.Logger"] = None
+                              ) -> list[MolFeatures]:
+    """Featurize a list of SMILES in parallel using multiprocessing.
+
+    **Order preservation**: uses `pool.imap` (NOT imap_unordered) so results
+    arrive in the same index order as input. A length sanity check is run at
+    the end; if it fails, we raise rather than return partial data.
+
+    Falls back to sequential featurize on a single worker or when the list is
+    smaller than chunksize.
+    """
+    import logging as _logging
+    import multiprocessing as _mp
+    import os
+    if log is None:
+        log = _logging.getLogger("vsleakkg.chem.featurize_batch_parallel")
+    if n_workers is None:
+        n_workers = min(os.cpu_count() or 1, 32)
+    if n_workers <= 1 or len(smiles) <= chunksize:
+        return [featurize(s) for s in smiles]
+    log.info("featurize parallel: %d SMILES on %d workers, chunksize=%d",
+             len(smiles), n_workers, chunksize)
+    with _mp.get_context("spawn").Pool(n_workers) as pool:
+        # imap preserves order; we still verify length + sentinel before returning.
+        out = list(pool.imap(featurize, smiles, chunksize=chunksize))
+    if len(out) != len(smiles):
+        raise RuntimeError(
+            f"featurize_batch_parallel returned {len(out)} items for {len(smiles)} input")
+    # Spot-check first and last entry: smiles_input must round-trip.
+    if smiles and out:
+        for idx in (0, len(smiles) // 2, len(smiles) - 1):
+            if smiles[idx] != out[idx].smiles_input:
+                raise RuntimeError(
+                    f"featurize parallel order mismatch at index {idx}: "
+                    f"input={smiles[idx]!r} got={out[idx].smiles_input!r}")
+    return out
+
+
+def parent_inchikey_batch_parallel(smiles: list[str], n_workers: Optional[int] = None,
+                                    chunksize: int = 2000,
+                                    log: Optional["logging.Logger"] = None
+                                    ) -> list[Optional[str]]:
+    """Compute salt-stripped parent InChIKey for many SMILES in parallel.
+
+    Same order-preservation contract as `featurize_batch_parallel`: results
+    align by index with input. The returned list always has length
+    `len(smiles)`; None entries mark parse / strip failures.
+    """
+    import logging as _logging
+    import multiprocessing as _mp
+    import os
+    if log is None:
+        log = _logging.getLogger("vsleakkg.chem.parent_inchikey_batch_parallel")
+    if n_workers is None:
+        n_workers = min(os.cpu_count() or 1, 32)
+    if n_workers <= 1 or len(smiles) <= chunksize:
+        return [parent_inchikey(s) for s in smiles]
+    log.info("parent_inchikey parallel: %d SMILES on %d workers, chunksize=%d",
+             len(smiles), n_workers, chunksize)
+    with _mp.get_context("spawn").Pool(n_workers) as pool:
+        out = list(pool.imap(parent_inchikey, smiles, chunksize=chunksize))
+    if len(out) != len(smiles):
+        raise RuntimeError(
+            f"parent_inchikey_batch_parallel returned {len(out)} items "
+            f"for {len(smiles)} input")
+    return out
+
+
+def parent_inchikey(smi: str) -> Optional[str]:
+    """Return the InChIKey of the salt-stripped parent molecule.
+
+    Removes common counterions (Cl-, Na+, etc. via RDKit's default SaltRemover
+    table) BEFORE computing the InChIKey. Two molecules that share the same
+    parent skeleton but differ only by salt form / protonation will have the
+    same `parent_inchikey` but different full `inchikey`. The KG uses this to
+    bridge them via `same_parent_inchikey_as` edges.
+
+    Returns None on parse failure or if salt-stripping leaves an empty
+    fragment.
+    """
+    mol = _parse(smi)
+    if mol is None:
+        return None
+    try:
+        stripped = _SALT_REMOVER.StripMol(mol, dontRemoveEverything=True)
+    except Exception:
+        stripped = mol
+    if stripped is None or stripped.GetNumAtoms() == 0:
+        return None
+    try:
+        return Chem.MolToInchiKey(stripped)
+    except Exception:
+        return None
 
 
 def tanimoto(a, b) -> float:

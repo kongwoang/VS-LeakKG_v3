@@ -50,7 +50,7 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
 
 from vsleakkg import chem as vc
-from vsleakkg import load_chembl_db, load_bigbind
+from vsleakkg import load_chembl_db, load_bigbind, load_bayesbind
 
 
 # -------- paths --------
@@ -69,6 +69,7 @@ CHEMBL_DB     = RAW / "ChEMBL" / "extracted" / "chembl_35" / "chembl_35_sqlite" 
 BINDINGDB_TSV = RAW / "BindingDB" / "extracted" / "BindingDB_All.tsv"
 BIGBIND_META  = RAW / "BigBind" / "metadata" / "BigBindV1.5"
 BIGBIND_EXTRACTED = RAW / "BigBind" / "extracted"
+BAYESBIND_ROOT = RAW / "BayesBind" / "extracted"
 
 for d in (PROCESSED, TABLES, REPORTS, LOGS, TODOS):
     d.mkdir(parents=True, exist_ok=True)
@@ -264,6 +265,7 @@ _CORPORA_FOR_MAPPING = (
     ("DUD-E",        "dude_examples.parquet",        "smiles_canonical", "inchikey"),
     ("DEKOIS",       "dekois_examples.parquet",      "smiles_canonical", "inchikey"),
     ("BigBind",      "bigbind_examples.parquet",     "smiles_canonical", "inchikey"),
+    ("BayesBind",    "bayesbind_examples.parquet",   "smiles_canonical", "inchikey"),
 )
 
 
@@ -428,7 +430,34 @@ def task_chembl_provenance() -> str:
     return f"prov_rows={benchmark_prov.height:,} mapped_molregnos={len(molregnos):,}"
 
 
-# -------- 6. load_bigbind --------
+# -------- 6. load_bayesbind --------
+def task_load_bayesbind() -> str:
+    """Parse BayesBind per-target actives/random CSVs into per-corpus parquets."""
+    if not BAYESBIND_ROOT.exists():
+        raise FileNotFoundError(BAYESBIND_ROOT)
+    out_ex  = PROCESSED / "bayesbind_examples.parquet"
+    out_n   = PROCESSED / "bayesbind_nodes.parquet"
+    out_e   = PROCESSED / "bayesbind_edges.parquet"
+    if out_ex.exists() and out_n.exists() and out_e.exists():
+        return (f"cached examples={pl.read_parquet(out_ex).height:,} "
+                f"nodes={pl.read_parquet(out_n).height:,} "
+                f"edges={pl.read_parquet(out_e).height:,}")
+    examples, nodes, edges = load_bayesbind.build(
+        extracted_dir=BAYESBIND_ROOT, log=log,
+    )
+    examples.write_parquet(out_ex)
+    nodes.write_parquet(out_n)
+    edges.write_parquet(out_e)
+    (REPORTS / "bayesbind_loader_report.md").write_text(
+        "# BayesBind loader summary\n\n" + ts() + "\n\n"
+        f"- examples: {examples.height:,}\n"
+        f"- nodes:    {nodes.height:,}\n"
+        f"- edges:    {edges.height:,}\n",
+        encoding="utf-8")
+    return f"examples={examples.height:,} nodes={nodes.height:,} edges={edges.height:,}"
+
+
+# -------- 7. load_bigbind --------
 def task_load_bigbind() -> str:
     """Parse BigBind activities + structures CSVs; emit per-corpus parquets.
 
@@ -482,6 +511,7 @@ def task_build_kg() -> str:
         ("DUD-E",        "dude"),
         ("DEKOIS",       "dekois"),
         ("BigBind",      "bigbind"),
+        ("BayesBind",    "bayesbind"),
     ]
     base_n_parts: list = []
     base_e_parts: list = []
@@ -505,12 +535,19 @@ def task_build_kg() -> str:
     nodes_new: List[tuple] = []
     edges_new: List[tuple] = []
 
-    # ---- Cross-corpus same_inchikey_as edges ----
-    # Two ligands with the same InChIKey but different canonical SMILES
-    # (tautomer / stereo) need an explicit edge since lig:md5(canonical) IDs
-    # do not collapse them.
+    # ---- Cross-corpus same_inchikey_as + same_parent_inchikey_as edges ----
+    # same_inchikey_as: same InChIKey, different canonical SMILES (tautomer /
+    #   stereo). lig:md5(canonical) IDs don't collapse these.
+    # same_parent_inchikey_as: same salt-stripped parent InChIKey but different
+    #   full InChIKey (HCl salt vs free base, protonation states). Addresses
+    #   the 178K salt-drift cases surfaced by merge_audit.
+    # Accumulate (smi, inchikey) across all corpora first, then run parent
+    # InChIKey computation in one parallel batch (32× speedup on VUW).
     smi_to_lig: dict = {}
     ik_to_smis: dict = {}
+    parent_to_smis: dict = {}
+    all_unique_smis: list[str] = []  # preserve insertion order
+    _seen_smi: set[str] = set()
     for human, slug in CORPORA:
         ex_path = PROCESSED / f"{slug}_examples.parquet"
         if not ex_path.exists():
@@ -525,9 +562,33 @@ def task_build_kg() -> str:
               .filter(pl.col("smi").is_not_null() & pl.col("inchikey").is_not_null())
               .unique()
               .collect())
-        for smi, ik in df.iter_rows():
+        smi_list = df["smi"].to_list()
+        ik_list = df["inchikey"].to_list()
+        for j in range(len(smi_list)):
+            smi = smi_list[j]
+            ik = ik_list[j]
             smi_to_lig.setdefault(smi, _lig_node_id(smi))
             ik_to_smis.setdefault(ik, set()).add(smi)
+            if smi not in _seen_smi:
+                _seen_smi.add(smi)
+                all_unique_smis.append(smi)
+        log.info("  %s: %d unique SMILES (running total %d)",
+                 human, len(smi_list), len(all_unique_smis))
+
+    # Parallel parent InChIKey compute — order-preserving via imap, length-checked.
+    log.info("computing parent InChIKey for %d unique SMILES (parallel) ...",
+             len(all_unique_smis))
+    parent_iks = vc.parent_inchikey_batch_parallel(all_unique_smis, log=log)
+    assert len(parent_iks) == len(all_unique_smis), \
+        f"parent_inchikey list length mismatch: {len(parent_iks)} vs {len(all_unique_smis)}"
+    n_pik_computed = 0
+    for j, smi in enumerate(all_unique_smis):
+        pik = parent_iks[j]
+        if pik:
+            parent_to_smis.setdefault(pik, set()).add(smi)
+            n_pik_computed += 1
+    log.info("parent InChIKey: %d computed, %d distinct parents",
+             n_pik_computed, len(parent_to_smis))
     cross_src = 0
     for ik, smis in ik_to_smis.items():
         if len(smis) <= 1:
@@ -540,6 +601,19 @@ def task_build_kg() -> str:
                               json.dumps({"inchikey": ik})))
             cross_src += 1
     log.info("cross-corpus same_inchikey_as edges: %d", cross_src)
+
+    cross_parent = 0
+    for pik, smis in parent_to_smis.items():
+        if len(smis) <= 1:
+            continue
+        smis_list = sorted(smis)
+        anchor = smi_to_lig[smis_list[0]]
+        for s in smis_list[1:]:
+            other = smi_to_lig[s]
+            edges_new.append((anchor, other, "same_parent_inchikey_as",
+                              json.dumps({"parent_inchikey": pik})))
+            cross_parent += 1
+    log.info("cross-corpus same_parent_inchikey_as edges: %d", cross_parent)
 
     # ---- DatasetSource + DatabaseRelease nodes ----
     for src, release in (("ChEMBL35", "ChEMBL_35"),
@@ -729,9 +803,10 @@ TASKS = [
     ("load_chembl",       task_load_chembl),
     ("load_bindingdb",    task_load_bindingdb),
     # Per-corpus loaders that produce <corpus>_examples/_nodes/_edges parquets.
-    # Has to run BEFORE chembl_map/bindingdb_map so its ligands are included in
-    # the benchmark <-> reference cross-ref maps.
+    # Must run BEFORE chembl_map/bindingdb_map so their ligands are included
+    # in the benchmark <-> reference cross-ref maps.
     ("load_bigbind",      task_load_bigbind),
+    ("load_bayesbind",    task_load_bayesbind),
     # Cross-reference maps + activity provenance (depend on all corpus parquets).
     ("chembl_map",        task_chembl_map),
     ("bindingdb_map",     task_bindingdb_map),

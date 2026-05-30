@@ -90,3 +90,85 @@ def load_all(root: Path) -> pl.DataFrame:
     if not parts:
         return pl.DataFrame()
     return pl.concat(parts, how="diagonal_relaxed")
+
+
+# ---------------------------------------------------------------------------
+# KG-ready builder — mirrors load_bigbind.build()
+# ---------------------------------------------------------------------------
+import logging as _logging
+from typing import Optional
+
+
+def _featurize_batch(smiles: list[str], log: Optional[_logging.Logger] = None
+                     ) -> tuple[list[Optional[str]], list[Optional[str]],
+                                list[Optional[str]], list[bool]]:
+    """Parallel featurize via vsleakkg.chem (order preserved + length checked)."""
+    from vsleakkg import chem as vc
+    feats = vc.featurize_batch_parallel(smiles, log=log)
+    canon = [f.smiles_canonical for f in feats]
+    iks = [f.inchikey for f in feats]
+    scaf = [f.scaffold_smiles for f in feats]
+    ok = [f.parse_ok for f in feats]
+    return canon, iks, scaf, ok
+
+
+def build(extracted_dir: Path,
+          log: Optional[_logging.Logger] = None
+          ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """Build (examples, nodes, edges) frames from BayesBind raw.
+
+    Returns the same triple as load_bigbind.build() so build_kg can wire it
+    into the same per-corpus pipeline. Uses the BayesBind `uniprot` column
+    from each target's actives.csv as the Protein target node id, falling
+    back to the target directory name when uniprot is missing.
+    """
+    from vsleakkg import build_graph as vb
+    if log is None:
+        log = _logging.getLogger("vsleakkg.load_bayesbind")
+    df = load_all(extracted_dir)
+    if df.is_empty():
+        raise RuntimeError("BayesBind: no examples loaded")
+    log.info("BayesBind: %d raw rows across %d targets",
+             df.height, df.select("target").n_unique())
+
+    # Featurize SMILES through the same RDKit pipeline as every other corpus.
+    log.info("BayesBind: re-canonicalizing SMILES via RDKit ...")
+    canon, iks, scaffolds, ok_list = _featurize_batch(df["smiles_input"].to_list(), log=log)
+    df = df.with_columns([
+        pl.Series("smiles_canonical", canon),
+        pl.Series("inchikey", iks),
+        pl.Series("scaffold_smiles", scaffolds),
+        pl.Series("parse_ok", ok_list),
+    ])
+    bad = int((~df["parse_ok"]).sum())
+    if bad:
+        log.warning("BayesBind: %d rows failed RDKit parse (excluded)", bad)
+    df = df.filter(pl.col("parse_ok"))
+
+    # Map to the loader contract used by build_graph.build_examples_frame.
+    # Use uniprot when available; fall back to the target directory name
+    # (already in `target` column) so we never emit a null protein target.
+    has_uniprot = "uniprot" in df.columns
+    if has_uniprot:
+        df = df.with_columns([
+            pl.coalesce([pl.col("uniprot"), pl.col("target")]).alias("target"),
+        ])
+    df = df.with_columns([
+        pl.lit("BayesBind").alias("source"),
+        pl.col("source_file").alias("ext_id_1"),
+        pl.lit(None, dtype=pl.Utf8).alias("ext_id_2"),
+    ]).select([
+        "smiles_canonical", "inchikey", "scaffold_smiles",
+        "source", "target", "label", "label_type", "split",
+        "ext_id_1", "ext_id_2",
+    ])
+
+    examples = vb.build_examples_frame(df)
+    nodes, edges = vb.make_nodes_edges(
+        examples,
+        include_decoy_protocol=True,    # BayesBind random decoys are a protocol
+        include_protein_target=True,
+    )
+    log.info("BayesBind: %d examples, %d nodes, %d edges",
+             examples.height, nodes.height, edges.height)
+    return examples, nodes, edges

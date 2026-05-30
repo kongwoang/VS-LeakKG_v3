@@ -1,4 +1,4 @@
-"""Merge integrity audit for the v3 KG.
+"""Merge integrity audit for the canonical KG.
 
 Detects 5 cases where "same chemical / structural entity" could end up as
 two distinct nodes due to ID-computation drift:
@@ -56,6 +56,7 @@ def main() -> int:
         ("DUD-E",        "dude_examples.parquet"),
         ("DEKOIS",       "dekois_examples.parquet"),
         ("BigBind",      "bigbind_examples.parquet"),
+        ("BayesBind",    "bayesbind_examples.parquet"),
     ]:
         p = PROCESSED / fname
         if not p.exists():

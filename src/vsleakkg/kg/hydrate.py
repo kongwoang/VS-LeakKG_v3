@@ -1,7 +1,7 @@
 """Hydrate v2 example IDs into model-consumable rows.
 
 v2 emits `(example_id, partition)` parquets from
-`vsleakkg.v2.split.greedy_assign(...)`. Every downstream model adapter
+`vsleakkg.kg.split.greedy_assign(...)`. Every downstream model adapter
 (SPRINT, DrugCLIP, LigUnity) needs richer fields per example: SMILES,
 target sequence, UniProt, label, source-specific IDs. This module
 provides:
@@ -26,7 +26,7 @@ archive on disk. This module only consumes the parquet.
 
 Typical use from a model adapter:
 
-    >>> from vsleakkg.v2.hydrate import Hydrator
+    >>> from vsleakkg.kg.hydrate import Hydrator
     >>> h = Hydrator.from_parquet("outputs/v2/graph/side_table.parquet")
     >>> rows = h.hydrate(example_ids=["chembl:ACT_1", "pdbbind:1abc"])
     >>> rows.select(["example_id", "smiles_canonical", "uniprot"]).head()
@@ -43,7 +43,7 @@ try:  # polars is in pyproject.toml's required deps
     import polars as pl
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
-        "vsleakkg.v2.hydrate requires polars. "
+        "vsleakkg.kg.hydrate requires polars. "
         "Install with: pip install -e .[dev]"
     ) from exc
 

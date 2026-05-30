@@ -48,23 +48,18 @@ _BIGBIND_ACTIVITIES_DEFAULT = "activities_all.csv"
 
 def _featurize_batch(smiles: list[str], log: Optional[logging.Logger] = None
                      ) -> tuple[list[Optional[str]], list[Optional[str]], list[Optional[str]], list[bool]]:
-    """Run RDKit canonical/scaffold/InChIKey over a list of SMILES.
+    """Run RDKit canonical/scaffold/InChIKey over a list of SMILES, in parallel
+    when possible.
 
-    Returns parallel lists: (canonical, inchikey, scaffold, parse_ok).
+    Uses `vsleakkg.chem.featurize_batch_parallel` which preserves input order
+    and sanity-checks the result length + a few index alignments before
+    returning. Returns parallel lists: (canonical, inchikey, scaffold, parse_ok).
     """
-    canon: list[Optional[str]] = []
-    iks: list[Optional[str]] = []
-    scaf: list[Optional[str]] = []
-    ok: list[bool] = []
-    n = len(smiles)
-    for i, smi in enumerate(smiles):
-        feats = vc.featurize(smi)
-        canon.append(feats.smiles_canonical)
-        iks.append(feats.inchikey)
-        scaf.append(feats.scaffold_smiles)
-        ok.append(feats.parse_ok)
-        if log is not None and (i + 1) % 50_000 == 0:
-            log.info("featurize: %d / %d", i + 1, n)
+    feats = vc.featurize_batch_parallel(smiles, log=log)
+    canon = [f.smiles_canonical for f in feats]
+    iks = [f.inchikey for f in feats]
+    scaf = [f.scaffold_smiles for f in feats]
+    ok = [f.parse_ok for f in feats]
     return canon, iks, scaf, ok
 
 

@@ -1,37 +1,37 @@
-"""Build the v2 contamination graph from the v3 processed parquets.
+"""Consolidate the raw KG into the canonical audit-ready schema.
 
-This module **consolidates** the per-corpus node/edge parquets plus
-the ChEMBL/BindingDB benchmark cross-references that `task_6_mvp2_graph`
-produces into the v2 schema (`vsleakkg.v2.schema`):
+Reads the raw KG produced by `vsleakkg.build_kg`:
 
-  mvp2_nodes / mvp2_edges
-            +
-  pdbbind_protein_clusters_{30,50,90}.parquet (sequence-axis anchor)
+  data/processed/kg_nodes.parquet
+  data/processed/kg_edges.parquet
+  data/processed/protein_clusters_{30,50,90}.parquet  (sequence-axis anchor,
+                                                       optional)
 
-  → outputs/v2/graph/v2_nodes.parquet
-  → outputs/v2/graph/v2_edges.parquet
-  → outputs/v2/graph/stats.csv
+Applies:
+  1. Schema mapping     — collapse corpus-level type names (e.g. ChEMBLAssay
+                          → Assay, ProteinTarget → Protein) onto the canonical
+                          set defined in `vsleakkg.kg.schema`.
+  2. Lossy node drop    — discard pure scaffolding (ChEMBLActivity, Split,
+                          LabelType, DatabaseRelease) that the audit doesn't
+                          need.
+  3. Protein clustering — emit ProteinCluster nodes + protein_in_cluster edges
+                          from the optional sequence-clustered parquets.
+  4. Hub mitigation     — flag any node with degree > HubMitigationConfig.
+                          degree_cap (default 1000) as `is_hub`.
+  5. Trivial scaffold   — drop scaffolds with ≤ trivial_scaffold_max_atoms
+                          (default 6) heavy atoms.
 
-The mapping is intentionally lossy. v1 carries scaffolding nodes the v2
-audit doesn't need (`ChEMBLActivity`, `Split`, `LabelType`,
-`AffinityType`, `DatabaseRelease`); they are dropped. The v1 edges that
-depend on those nodes are also dropped. What survives is the six-axis
-contamination graph (pocket axis removed in the v3 redesign).
+Outputs:
 
-The cluster parquet name is kept ("pdbbind_protein_clusters_*") for
-backward-compatibility with already-extracted MMseqs2 outputs even
-though after the v3 redesign the protein anchor is no longer PDBBind-
-specific (any Protein node in the KG can be clustered).
-
-Edges that need an encoder we don't have on this box (time bins, assay
-joins) are documented as TODOs in `stats.csv` so the audit report can
-flag them.
+  outputs/kg/canonical_nodes.parquet
+  outputs/kg/canonical_edges.parquet
+  outputs/kg/stats.csv
 
 CLI:
 
-    python -m vsleakkg.v2.build_graph \
-        --output-dir outputs/v2/graph \
-        [--corpus litpcba_ave|dude|dekois|bigbind|all]   # default all
+    python -m vsleakkg.kg.consolidate \\
+        --output-dir outputs/kg \\
+        [--corpus litpcba_ave|dude|dekois|bigbind|bayesbind|all]   # default all
         [--limit 100000]    # for smoke-testing
 
 The script is idempotent: it will overwrite the output parquets.
@@ -62,10 +62,16 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# v1 -> v2 mapping tables
+# Corpus-level → canonical schema mapping tables
 # ---------------------------------------------------------------------------
+# `build_kg` emits the raw KG using the corpus-level node/edge type names
+# inherited from the per-corpus loaders (`Ligand`, `ProteinTarget`,
+# `ChEMBLAssay`, ...). The canonical schema (`vsleakkg.kg.schema`) collapses
+# semantically-equivalent types onto a smaller set. These maps drive the
+# rewrite, with the side effect that certain pure-scaffolding node/edge types
+# are dropped entirely.
 
-V1_TO_V2_NODE_TYPE: dict[str, str] = {
+CORPUS_TO_CANONICAL_NODE_TYPE: dict[str, str] = {
     "Example": NodeType.EXAMPLE.value,
     "Ligand": NodeType.LIGAND.value,
     "Scaffold": NodeType.SCAFFOLD.value,
@@ -77,26 +83,28 @@ V1_TO_V2_NODE_TYPE: dict[str, str] = {
     "DecoyProtocol": NodeType.DECOY_PROTOCOL.value,
 }
 
-# v1 node types that are absorbed elsewhere or are v1-specific scaffolding.
-V1_DROPPED_NODES: frozenset[str] = frozenset({
-    "ChEMBLActivity",        # absorbed into Example (label, label_type)
+# Corpus-level node types that are absorbed elsewhere or are pure scaffolding.
+DROPPED_NODES: frozenset[str] = frozenset({
+    "ChEMBLActivity",        # absorbed into Example via label/label_type
     "AffinityType",          # static lookup table
     "LabelType",             # static lookup table
     "DatabaseRelease",       # version metadata
-    "Split",                 # v1 split labels; v2 emits partition assignments separately
+    "Split",                 # corpus-level split labels; canonical schema emits
+                             # partition assignments separately
 })
 
-V1_TO_V2_EDGE_TYPE: dict[str, str] = {
+CORPUS_TO_CANONICAL_EDGE_TYPE: dict[str, str] = {
     "example_has_ligand": EdgeType.EXAMPLE_HAS_LIGAND.value,
     "example_targets_protein": EdgeType.EXAMPLE_HAS_PROTEIN.value,
     "example_from_source": EdgeType.EXAMPLE_FROM_SOURCE.value,
     "ligand_has_scaffold": EdgeType.LIGAND_SCAFFOLD.value,
     "ligand_similar_to_ligand": EdgeType.LIGAND_SIMILAR.value,
     "same_inchikey_as": EdgeType.LIGAND_EXACT.value,
+    "same_parent_inchikey_as": EdgeType.LIGAND_PARENT_EXACT.value,
     "example_uses_decoy_protocol": EdgeType.SOURCE_DECOY_PROTOCOL.value,
 }
 
-V1_DROPPED_EDGES: frozenset[str] = frozenset({
+DROPPED_EDGES: frozenset[str] = frozenset({
     "example_in_split",
     "example_has_label_type",
 })
@@ -151,21 +159,21 @@ class BuildStats:
 
 
 def _map_nodes(nodes: pl.DataFrame) -> tuple[pl.DataFrame, int]:
-    """Map v1 node_type to v2 node_type. Drop scaffolding-only v1 types."""
-    keep = list(V1_TO_V2_NODE_TYPE.keys())
+    """Map corpus node_type to canonical node_type. Drop scaffolding-only types."""
+    keep = list(CORPUS_TO_CANONICAL_NODE_TYPE.keys())
     n_in = nodes.height
     kept = nodes.filter(pl.col("node_type").is_in(keep)).with_columns(
-        pl.col("node_type").replace(V1_TO_V2_NODE_TYPE).alias("node_type")
+        pl.col("node_type").replace(CORPUS_TO_CANONICAL_NODE_TYPE).alias("node_type")
     )
     return kept, n_in - kept.height
 
 
 def _map_edges(edges: pl.DataFrame) -> tuple[pl.DataFrame, int]:
-    """Map v1 edge_type to v2 edge_type. Drop scaffolding-only v1 edges."""
-    keep = list(V1_TO_V2_EDGE_TYPE.keys())
+    """Map corpus edge_type to canonical edge_type. Drop scaffolding-only edges."""
+    keep = list(CORPUS_TO_CANONICAL_EDGE_TYPE.keys())
     n_in = edges.height
     kept = edges.filter(pl.col("edge_type").is_in(keep)).with_columns(
-        pl.col("edge_type").replace(V1_TO_V2_EDGE_TYPE).alias("edge_type")
+        pl.col("edge_type").replace(CORPUS_TO_CANONICAL_EDGE_TYPE).alias("edge_type")
     )
     return kept, n_in - kept.height
 
@@ -230,22 +238,20 @@ def _add_protein_cluster_edges(
     processed: Path,
     stats: BuildStats,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Add protein_in_cluster edges from pdbbind cluster parquets.
+    """Add protein_in_cluster edges from sequence-clustered parquets.
 
-    v1 emits `pdbbind_protein_clusters_{30,50,90}.parquet` with columns
-    (probably) (protein_id, cluster_id). We treat each cluster_id as a
-    ProteinCluster node tagged with resolution = "30" | "50" | "90".
+    Reads `protein_clusters_{30,50,90}.parquet` with columns (protein_id,
+    cluster_id). Each cluster_id becomes a ProteinCluster node tagged with
+    resolution = "30" | "50" | "90".
 
-    The v2 schema names the 90% pocket-similarity edge weight
-    `protein_cluster_90`. v1 happens to ship 30 / 50 / 90 not 30 / 40 /
-    90; we keep all three but the 50% one will get the default weight
-    until we re-cluster at 40%.
+    The canonical schema weights are tuned for 30 / 50 / 90% sequence identity.
+    Missing parquets are recorded in `stats.deferred` for the audit report.
     """
     new_node_dfs: list[pl.DataFrame] = []
     new_edge_dfs: list[pl.DataFrame] = []
     counts: dict[str, int] = {}
     for res in ("30", "50", "90"):
-        f = processed / f"pdbbind_protein_clusters_{res}.parquet"
+        f = processed / f"protein_clusters_{res}.parquet"
         if not f.exists():
             counts[res] = 0
             stats.deferred = (stats.deferred or []) + [f"protein_clusters_{res}_missing"]
@@ -308,23 +314,24 @@ def _add_protein_cluster_edges(
 # ---------------------------------------------------------------------------
 
 
-def build_graph(
+def consolidate(
     output_dir: Path,
     *,
     corpus: str = "all",
     limit: int | None = None,
     hub_cfg: HubMitigationConfig | None = None,
 ) -> BuildStats:
-    """Build the v2 graph parquets under `output_dir`.
+    """Consolidate the raw KG into the canonical schema parquets.
 
     Parameters
     ----------
     output_dir
-        Where to write v2_nodes.parquet, v2_edges.parquet, stats.csv.
+        Where to write canonical_nodes.parquet, canonical_edges.parquet,
+        stats.csv.
     corpus
-        "all" -> read v1's mvp2_nodes/edges (combined).
+        "all" -> read the merged kg_nodes/kg_edges from `build_kg`.
         Otherwise the per-corpus parquet name ("litpcba_ave", "dude",
-        "dekois", "pdbbind").
+        "dekois", "bigbind", "bayesbind").
     limit
         Optional row cap for smoke-testing.
     hub_cfg
@@ -396,8 +403,8 @@ def build_graph(
         "example_from_publication_needs_chembl_document_join",
     ]
 
-    nodes_out = output_dir / "v2_nodes.parquet"
-    edges_out = output_dir / "v2_edges.parquet"
+    nodes_out = output_dir / "canonical_nodes.parquet"
+    edges_out = output_dir / "canonical_edges.parquet"
     stats_out = output_dir / "stats.csv"
 
     nodes_df.write_parquet(nodes_out)
@@ -405,7 +412,7 @@ def build_graph(
     pl.DataFrame(stats.to_csv_rows()).write_csv(stats_out)
 
     log.info(
-        "v2 graph: %s nodes, %s edges, wrote to %s (%.1fs)",
+        "canonical KG: %s nodes, %s edges, wrote to %s (%.1fs)",
         stats.n_nodes_out,
         stats.n_edges_out,
         output_dir,
@@ -418,7 +425,7 @@ def _cli() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--corpus", default="all",
-                   choices=["all", "litpcba_ave", "dude", "dekois", "bigbind"])
+                   choices=["all", "litpcba_ave", "dude", "dekois", "bigbind", "bayesbind"])
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args()
@@ -426,7 +433,7 @@ def _cli() -> None:
         level=args.log_level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    stats = build_graph(
+    stats = consolidate(
         output_dir=args.output_dir,
         corpus=args.corpus,
         limit=args.limit,

@@ -1,4 +1,4 @@
-"""v2 schema: node types, edge types, and default leakage weights.
+"""Canonical KG schema — node / edge types and default leakage weights.
 
 The weights match proposal.tex Table 2 (the "Default edge types and leakage
 weights" table). Edit DEFAULT_WEIGHTS to change a release-wide default and bump
@@ -36,11 +36,12 @@ class EdgeType(str, Enum):
     EXAMPLE_IN_TRAINSET = "example_in_trainset"  # Mode B
 
     # identity / similarity edges between content nodes
-    LIGAND_EXACT = "ligand_exact"
+    LIGAND_EXACT = "ligand_exact"               # same full InChIKey, different SMILES
+    LIGAND_PARENT_EXACT = "ligand_parent_exact" # same parent (salt-stripped) InChIKey
     LIGAND_SCAFFOLD = "ligand_scaffold"
-    LIGAND_SIMILAR = "ligand_similar"  # Morgan Tanimoto >= 0.85
+    LIGAND_SIMILAR = "ligand_similar"           # Morgan Tanimoto >= 0.85
     PROTEIN_EXACT = "protein_exact"
-    PROTEIN_IN_CLUSTER = "protein_in_cluster"  # resolution stored on the cluster node
+    PROTEIN_IN_CLUSTER = "protein_in_cluster"   # resolution stored on the cluster node
     SOURCE_DECOY_PROTOCOL = "source_decoy_protocol"
     TIME_OVERLAP = "time_overlap"
 
@@ -50,6 +51,7 @@ class EdgeType(str, Enum):
 DEFAULT_WEIGHTS: dict[str, float] = {
     EdgeType.EXAMPLE_HAS_LIGAND.value: 1.00,
     EdgeType.LIGAND_EXACT.value: 1.00,
+    EdgeType.LIGAND_PARENT_EXACT.value: 0.95,   # salt/protonation variant — near-identical leak
     EdgeType.LIGAND_SCAFFOLD.value: 0.70,
     EdgeType.LIGAND_SIMILAR.value: 0.65,
     EdgeType.EXAMPLE_HAS_PROTEIN.value: 1.00,
@@ -75,6 +77,7 @@ AXIS_EDGE_TYPES: dict[str, list[str]] = {
     "ligand": [
         EdgeType.EXAMPLE_HAS_LIGAND.value,
         EdgeType.LIGAND_EXACT.value,
+        EdgeType.LIGAND_PARENT_EXACT.value,
         EdgeType.LIGAND_SIMILAR.value,
     ],
     "scaffold": [
