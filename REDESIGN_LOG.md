@@ -70,12 +70,86 @@ Root cause guess: polars iter_rows(named=True) on >5M-row DataFrames may return 
 | Pocket | varied | 0 (axis removed) |
 | ligand_exact | 0 | 3,721 |
 
-### Known follow-ups
+### Known follow-ups (as of v3 KG initial build)
 
-1. **Diagnose & fix iter_rows null-byte bug** in build_kg.task_build_kg. Convert chembl_provenance / mapped_mol / mapped_with_bdb to Python lists before iteration. Re-run build_kg and verify the 4.6M nodes are recovered.
-2. **Protein-axis anchor**: with PDBBind dropped, only 991 Protein nodes remain. To restore a meaningful protein axis, extract sequences for all benchmark + ChEMBL/BindingDB targets and rebuild MMseqs2 clusters across all of them.
-3. **BayesBind integration**: write `load_bayesbind.py` analogous to `load_bigbind.py` so BayesBind enters the audit as a corpus (currently outside).
-4. **Pocket axis**: hard-removed in v3 redesign. If structure-based audit is wanted, would need re-introducing with proper ESM-IF1 or PocketGen encoder pipeline.
+1. **Diagnose & fix iter_rows null-byte bug** in build_kg.task_build_kg. Convert chembl_provenance / mapped_mol / mapped_with_bdb to Python lists before iteration. Re-run build_kg and verify the 4.6M nodes are recovered. **— Fixed in commit 3b4df08.**
+2. **Protein-axis anchor**: with PDBBind dropped, only 991 Protein nodes remain. To restore a meaningful protein axis, extract sequences for all benchmark + ChEMBL/BindingDB targets and rebuild MMseqs2 clusters across all of them. **— Still open.**
+3. **BayesBind integration**: write `load_bayesbind.py` analogous to `load_bigbind.py` so BayesBind enters the audit as a corpus (currently outside). **— Still open.**
+4. **Pocket axis**: hard-removed in v3 redesign. If structure-based audit is wanted, would need re-introducing with proper ESM-IF1 or PocketGen encoder pipeline. **— User confirmed drop in commit 2e20a13 cycle.**
+
+---
+
+## Rebuild from scratch — 2026-05-30 13:05
+
+User instruction: drop pocket axis fully + rebuild clean KG from v3, keep nothing from v2, run merge integrity audit.
+
+### Cleanup performed on VUW
+- Removed `pdbbind_*.parquet`, `pdbbind_*.fasta`, `pdbbind_*.tsv` (v2 anchors no longer valid after PDBBind drop)
+- Removed `bigbind_*.parquet`, `kg_*.parquet`, `benchmark_to_*.parquet`, `benchmark_chembl_*.parquet` (stale v2 outputs)
+- Removed entire `outputs/` tree (logs, reports, v2 graphs)
+- Removed `data/raw/DUD-E_pockets_fetched/` (pocket axis dropped)
+
+Kept: ChEMBL/BindingDB raw extracts + per-corpus `*_examples/_nodes/_edges` parquets (these are dataset-loader outputs, not v2 artifacts).
+
+### Bug fixes applied (commit 3b4df08)
+
+1. **iter_rows null-byte fix**: `task_build_kg` now pre-extracts every column it needs from `mapped_mol`/`prov_clean`/`mapped_with_bdb` via `.to_list()` before iterating. This recovered ~5.4M nodes vs the prior build (16.66M total vs 11.27M).
+2. **benchmark_lid SMILES selection**: switched from `canonical_smiles_right` (ChEMBL side) to `canonical_smiles` (benchmark side) so cross-references land on the correct per-corpus Ligand node. ChEMBL canonical now stored separately in props as `canonical_smiles_chembl` for traceability.
+
+### Pipeline runtime (rebuild)
+- load_chembl: 0.9s (cached)
+- load_bindingdb: 1.0s (cached)
+- load_bigbind: 14 min (RDKit canonicalize 583K SMILES)
+- chembl_map: 3.3s — BigBind 99.99% mapped
+- bindingdb_map: 1.6s
+- chembl_provenance: 348s — pulled 7.44M activities
+- build_kg: 138s
+- v2 consolidator: 17s
+- merge_audit: 12s
+- **Total ~25 min**
+
+### Final KG (clean rebuild)
+
+| Metric | After bug fix |
+|---|---:|
+| Raw kg_nodes | 16,661,230 |
+| Raw kg_edges | 60,665,905 |
+| v2 nodes | **8,348,573** |
+| v2 edges | **17,765,329** |
+| Example | 4,764,621 |
+| Ligand | 2,013,247 |
+| Scaffold | 645,558 |
+| Assay | 857,115 |
+| Publication | 66,653 |
+| Protein | 1,371 |
+| DatasetSource | 6 |
+| DecoyProtocol | 2 |
+| example_from_source | 4,764,621 |
+| example_has_ligand | 4,764,617 |
+| example_has_protein | 4,764,621 |
+| ligand_scaffold | 1,934,033 |
+| source_decoy_protocol | 1,529,687 |
+| ligand_exact (cross-corpus) | **6,939** |
+| ligand_similar | 811 |
+| protein_in_cluster | 0 (clusters intentionally not rebuilt — see TODO #2) |
+
+### Merge integrity audit (outputs/reports/merge_audit_report.md)
+
+**4 invariants — all PASS**:
+- Duplicate node_id: 0
+- Null-byte node_id: 0 (confirms bug fix)
+- Dangling edges by src: 0
+- Dangling edges by dst: 0
+
+**Drift cases detected**:
+
+| Case | Count | Risk | Mitigation present? |
+|---|---:|---|---|
+| 1+2+4: same-InChIKey, different canonical_smiles (tautomer/protonation drift across corpora) | 6,776 InChIKeys → 6,939 excess Ligand nodes | Low (0.34%) | YES — `same_inchikey_as` edges bridge them |
+| 3: same parent InChIKey, different full InChIKey (salt/protonation/tautomer) | 178,587 parents have variants (10.1%) | **Medium** | NO — current code does not strip salts. Train-on-HCl-salt / test-on-free-base would underestimate leakage |
+| 5: same (source, target, ligand) → multiple Example rows | 324 triples | Trivial | No action |
+
+Case 3 is the only material concern. Fix would require salt-stripping pre-canonicalize in `vsleakkg.chem.featurize` plus emission of `same_parent_inchikey_as` edges. Effort: ~1-2 hours.
 
 ## Phase 2d + 3a notes
 
