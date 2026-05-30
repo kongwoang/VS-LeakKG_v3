@@ -60,6 +60,29 @@ def load_targets(conn: sqlite3.Connection) -> pl.DataFrame:
         orient="row")
 
 
+def load_target_sequences(conn: sqlite3.Connection) -> pl.DataFrame:
+    """One row per (tid, accession) with the UniProt accession + sequence.
+
+    Joins target_dictionary -> target_components -> component_sequences. A
+    single tid can have multiple components (e.g. heteromeric complexes);
+    each row is one protein chain.
+    """
+    q = """
+    SELECT td.tid, td.chembl_id AS target_chembl_id,
+           cs.accession, cs.sequence, cs.component_type, cs.organism,
+           cs.description
+    FROM target_dictionary td
+    JOIN target_components tc ON tc.tid = td.tid
+    JOIN component_sequences cs ON cs.component_id = tc.component_id
+    WHERE cs.sequence IS NOT NULL
+      AND cs.component_type = 'PROTEIN'
+    """
+    return pl.DataFrame(list(conn.execute(q)),
+        schema=["tid", "target_chembl_id", "accession", "sequence",
+                "component_type", "organism", "description"],
+        orient="row")
+
+
 def load_documents(conn: sqlite3.Connection) -> pl.DataFrame:
     q = """
     SELECT d.doc_id, d.chembl_id AS document_chembl_id,
