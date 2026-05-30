@@ -625,15 +625,24 @@ def consolidate(
                  dict(by_type.iter_rows()))
         stats.deferred = (stats.deferred or []) + [f"dropped_orphans={dropped_orphans}"]
 
-    # Dedup (src, dst, edge_type) — multiple raw sources can emit the same
-    # logical edge (e.g. per-corpus ligand_similar_to_ligand + D5's
-    # ligand_similar both collapse to LIGAND_SIMILAR). Keep one row per triple.
-    n_before_e = edges.height
-    edges = edges.unique(subset=["src", "dst", "edge_type"], keep="first")
-    deduped = n_before_e - edges.height
-    if deduped:
-        log.info("deduped %d redundant edges on (src, dst, edge_type)", deduped)
-        stats.deferred = (stats.deferred or []) + [f"deduped_redundant_edges={deduped}"]
+    # Dedup is only needed for `ligand_similar` (per-corpus loader's
+    # ligand_similar_to_ligand collides with D5's ligand_similar after the
+    # canonical mapping). Every other edge type has globally unique
+    # (src, dst) pairs by construction. Doing a global `unique` on 38M+
+    # edges would OOM; doing the targeted dedup on the 450K ligand_similar
+    # subset stays well under memory.
+    ls = edges.filter(pl.col("edge_type") == "ligand_similar")
+    if ls.height:
+        n_before_e = ls.height
+        ls = ls.unique(subset=["src", "dst"], keep="first")
+        deduped = n_before_e - ls.height
+        edges = pl.concat([
+            edges.filter(pl.col("edge_type") != "ligand_similar"),
+            ls,
+        ], how="vertical_relaxed")
+        if deduped:
+            log.info("deduped %d redundant ligand_similar edges", deduped)
+            stats.deferred = (stats.deferred or []) + [f"deduped_ligand_similar={deduped}"]
 
     # Already eager DataFrames at this point.
     nodes_df = nodes
