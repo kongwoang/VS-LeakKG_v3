@@ -894,8 +894,8 @@ def task_build_kg() -> str:
         + "\n".join(f"- {r['edge_type']}: {r['n']:,}" for r in eet.iter_rows(named=True))
         + "\n", encoding="utf-8")
     return (f"nodes={nodes.height:,}, edges={edges.height:,}, "
-            f"chembl_lig={len(mapped_mol):,}, bdb_lig={len(seen_bdb):,}, "
-            f"cross_src_inchikey={cross_src}")
+            f"chembl_lig={len(mapped_mol):,}, bdb_lig={len(seen_bdb_lig):,}, "
+            f"cross_src_inchikey={cross_src}, cross_parent={cross_parent}")
 
 
 # -------- main --------
