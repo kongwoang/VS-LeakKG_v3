@@ -412,17 +412,21 @@ def consolidate(
     # don't touch any benchmark Example, and ProteinClusters whose members'
     # accessions aren't represented in the KG. Both clutter the canonical
     # output without contributing audit signal.
+    #
+    # Implementation uses semi-joins instead of `is_in(Series)` (which polars
+    # 1.x deprecated to ambiguous behaviour) so we don't silently keep all
+    # orphans on newer polars.
     touched_ids = pl.concat(
         [edges.select(pl.col("src").alias("node_id")),
          edges.select(pl.col("dst").alias("node_id"))],
         how="vertical_relaxed",
     ).unique()
-    orphan_types = ("Protein", "ProteinCluster")
+    orphan_types = {"Protein", "ProteinCluster"}
+    non_orphan_candidates = nodes.filter(~pl.col("node_type").is_in(list(orphan_types)))
+    orphan_candidates = nodes.filter(pl.col("node_type").is_in(list(orphan_types)))
+    kept_orphans = orphan_candidates.join(touched_ids, on="node_id", how="semi")
     n_before_n = nodes.height
-    nodes = nodes.filter(
-        ~pl.col("node_type").is_in(list(orphan_types))
-        | pl.col("node_id").is_in(touched_ids["node_id"])
-    )
+    nodes = pl.concat([non_orphan_candidates, kept_orphans], how="vertical_relaxed")
     dropped_orphans = n_before_n - nodes.height
     if dropped_orphans:
         log.info("dropped %d orphan Protein/ProteinCluster nodes", dropped_orphans)
