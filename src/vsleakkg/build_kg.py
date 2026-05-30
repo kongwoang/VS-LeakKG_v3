@@ -727,33 +727,37 @@ def task_build_kg() -> str:
                     targets_seen.add(tgt_chid)
                 edges_new.append((act_nid, tgt_nid, "chembl_activity_has_target", "{}"))
 
-    # ---- BindingDB ligand subgraph ----
+    # ---- BindingDB ligand + record + publication + target subgraph ----
+    # (Enriched: BindingDB records bring Publication (pmid/doi) and Protein
+    # (UniProt) provenance into the KG. This expands the audit "did model X
+    # train on this protein?" signal beyond the ChEMBL-only path.)
     mp_bdb = pl.read_parquet(PROCESSED / "benchmark_to_bindingdb_ligand_map.parquet")
     mapped_bdb = mp_bdb.filter(pl.col("match_method") != "unmatched").unique(subset=["inchikey", "benchmark_dataset"])
     bdb_lig = pl.read_parquet(PROCESSED / "bindingdb_ligands_minimal.parquet")
     bdb_lig_ik = bdb_lig.unique(subset=["ligand_inchikey"])
     mapped_with_bdb = mapped_bdb.join(bdb_lig_ik.rename({"ligand_inchikey": "inchikey"}),
                                        on="inchikey", how="left")
-    # Same defensive pattern for the BindingDB loop.
     b_ik = mapped_with_bdb["inchikey"].to_list()
     b_smi = mapped_with_bdb["canonical_smiles"].to_list()
     b_lsmi = mapped_with_bdb["ligand_smiles"].to_list()
     b_chid = mapped_with_bdb["chembl_id_ligand"].to_list()
     b_zinc = mapped_with_bdb["zinc_id_ligand"].to_list()
     b_match = mapped_with_bdb["match_method"].to_list()
-    seen_bdb = set()
+    seen_bdb_lig = set()
+    benchmark_iks = set()
     for i in range(mapped_with_bdb.height):
         ik = b_ik[i]
         if not ik:
             continue
+        benchmark_iks.add(ik)
         nid = f"bdb_lig:{ik}"
-        if ik not in seen_bdb:
+        if ik not in seen_bdb_lig:
             nodes_new.append((nid, "BindingDBLigand", ik,
                               json.dumps({"smiles": b_lsmi[i],
                                            "chembl_id_ligand": b_chid[i],
                                            "zinc_id_ligand": b_zinc[i]})))
             edges_new.append((nid, "src:BindingDB202605", "bindingdb_record_from_source", "{}"))
-            seen_bdb.add(ik)
+            seen_bdb_lig.add(ik)
         bench_smi = b_smi[i]
         if bench_smi:
             benchmark_lid = _lig_node_id(bench_smi)
@@ -761,6 +765,78 @@ def task_build_kg() -> str:
             edges_new.append((benchmark_lid, nid,
                               "benchmark_ligand_same_inchikey_as_bindingdb_ligand",
                               json.dumps({"match_method": b_match[i]})))
+
+    # Now bring in the BindingDB record-level provenance for the mapped ligands:
+    # Publication (pmid/doi) and Protein (UniProt) nodes.
+    bdb_rec_path = PROCESSED / "bindingdb_records_minimal.parquet"
+    if bdb_rec_path.exists() and benchmark_iks:
+        bdb_rec = pl.read_parquet(bdb_rec_path)
+        # Restrict to records whose ligand has been mapped to a benchmark.
+        bdb_rec_b = bdb_rec.filter(pl.col("ligand_inchikey").is_in(list(benchmark_iks)))
+        log.info("BindingDB record enrichment: %d records for %d mapped ligands",
+                 bdb_rec_b.height, len(benchmark_iks))
+        # Extract columns to lists (avoid the iter_rows null-byte bug).
+        r_ik = bdb_rec_b["ligand_inchikey"].to_list() if "ligand_inchikey" in bdb_rec_b.columns else []
+        r_pmid = bdb_rec_b["pmid"].to_list() if "pmid" in bdb_rec_b.columns else [None] * bdb_rec_b.height
+        r_doi = bdb_rec_b["article_doi"].to_list() if "article_doi" in bdb_rec_b.columns else [None] * bdb_rec_b.height
+        r_uniprot = bdb_rec_b["uniprot_swissprot_id"].to_list() if "uniprot_swissprot_id" in bdb_rec_b.columns else [None] * bdb_rec_b.height
+        r_record_id = bdb_rec_b["bindingdb_record_id"].to_list() if "bindingdb_record_id" in bdb_rec_b.columns else [None] * bdb_rec_b.height
+        seen_pub: set = set()
+        seen_prot: set = set()
+        seen_assay: set = set()
+        n_pub = n_prot = n_assay = 0
+        for j in range(len(r_ik)):
+            ik = r_ik[j]
+            if not ik:
+                continue
+            bdb_lid = f"bdb_lig:{ik}"
+            # Publication: prefer PMID; fall back to DOI.
+            pmid = (r_pmid[j] or "").strip()
+            doi = (r_doi[j] or "").strip()
+            if pmid:
+                pub_nid = f"pub:pmid:{pmid}"
+                if pmid not in seen_pub:
+                    nodes_new.append((pub_nid, "Publication", pmid,
+                                      json.dumps({"pmid": pmid, "doi": doi or None})))
+                    edges_new.append((pub_nid, "src:BindingDB202605", "publication_from_source", "{}"))
+                    seen_pub.add(pmid)
+                    n_pub += 1
+                edges_new.append((bdb_lid, pub_nid, "bindingdb_ligand_in_publication", "{}"))
+            elif doi:
+                pub_nid = f"pub:doi:{doi}"
+                if doi not in seen_pub:
+                    nodes_new.append((pub_nid, "Publication", doi,
+                                      json.dumps({"doi": doi})))
+                    edges_new.append((pub_nid, "src:BindingDB202605", "publication_from_source", "{}"))
+                    seen_pub.add(doi)
+                    n_pub += 1
+                edges_new.append((bdb_lid, pub_nid, "bindingdb_ligand_in_publication", "{}"))
+            # Protein from UniProt SwissProt accession.
+            uniprot = (r_uniprot[j] or "").strip()
+            if uniprot:
+                prot_nid = f"protein:{uniprot}"
+                if uniprot not in seen_prot:
+                    nodes_new.append((prot_nid, "Protein", uniprot,
+                                      json.dumps({"uniprot": uniprot, "source": "BindingDB"})))
+                    seen_prot.add(uniprot)
+                    n_prot += 1
+                edges_new.append((bdb_lid, prot_nid, "bindingdb_ligand_targets_protein", "{}"))
+            # Assay-like node from BindingDB record id (one per measurement).
+            rec_id = r_record_id[j]
+            if rec_id is not None and str(rec_id).strip():
+                rec_str = str(rec_id).strip()
+                asy_nid = f"bdb_rec:{rec_str}"
+                if rec_str not in seen_assay:
+                    nodes_new.append((asy_nid, "Assay", rec_str,
+                                      json.dumps({"source": "BindingDB",
+                                                   "bindingdb_record_id": rec_str})))
+                    seen_assay.add(rec_str)
+                    n_assay += 1
+                edges_new.append((asy_nid, bdb_lid, "bindingdb_record_has_ligand", "{}"))
+                if uniprot:
+                    edges_new.append((asy_nid, f"protein:{uniprot}", "bindingdb_record_has_protein", "{}"))
+        log.info("BindingDB enrichment emitted: %d Publication, %d Protein, %d Assay nodes",
+                 n_pub, n_prot, n_assay)
 
     # ---- Persist ----
     n_df = pl.DataFrame(nodes_new, schema=["node_id", "node_type", "label", "props"], orient="row")
@@ -778,6 +854,25 @@ def task_build_kg() -> str:
     valid = nodes.select("node_id")
     edges = (edges.join(valid.rename({"node_id": "src"}), on="src", how="semi")
                   .join(valid.rename({"node_id": "dst"}), on="dst", how="semi"))
+    # Build-time invariants — fail loudly so regressions are caught at write
+    # time rather than later by audit. If any of these fire, look for new
+    # iter_rows / unchecked f-string interpolation paths.
+    _dup = nodes.group_by("node_id").len().filter(pl.col("len") > 1)
+    if _dup.height:
+        raise RuntimeError(
+            f"INVARIANT FAIL: {_dup.height} duplicate node_id rows after dedup")
+    _null_byte = nodes.filter(~pl.col("node_id").str.contains(":"))
+    if _null_byte.height:
+        raise RuntimeError(
+            f"INVARIANT FAIL: {_null_byte.height} node_ids missing ':' prefix")
+    _ids = nodes.select("node_id")
+    _dangle_src = edges.join(_ids.rename({"node_id": "src"}), on="src", how="anti").height
+    _dangle_dst = edges.join(_ids.rename({"node_id": "dst"}), on="dst", how="anti").height
+    if _dangle_src or _dangle_dst:
+        raise RuntimeError(
+            f"INVARIANT FAIL: dangling edges src={_dangle_src} dst={_dangle_dst}")
+    log.info("build-time invariants passed: 0 dup, 0 null-byte, 0 dangling")
+
     nodes.write_parquet(PROCESSED / "kg_nodes.parquet")
     edges.write_parquet(PROCESSED / "kg_edges.parquet")
 

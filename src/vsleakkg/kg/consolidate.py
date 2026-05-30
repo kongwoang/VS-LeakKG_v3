@@ -103,6 +103,12 @@ CORPUS_TO_CANONICAL_EDGE_TYPE: dict[str, str] = {
     "same_parent_inchikey_as": EdgeType.LIGAND_PARENT_EXACT.value,
     "example_uses_decoy_protocol": EdgeType.SOURCE_DECOY_PROTOCOL.value,
 }
+# BindingDB enrichment edges (bdb_lig -> Publication / Protein / Assay /
+# bdb_rec -> Ligand / Protein) are NOT mapped here: they form 2-hop paths
+# through `bdb_lig` from benchmark Example -> Ligand -> bdb_lig, which the
+# canonical single-edge axis schema can't represent. They remain in the raw
+# kg_edges parquet for downstream graph-traversal queries that want the
+# full BindingDB provenance.
 
 DROPPED_EDGES: frozenset[str] = frozenset({
     "example_in_split",
