@@ -859,8 +859,14 @@ def task_build_kg() -> str:
     # iter_rows / unchecked f-string interpolation paths.
     _dup = nodes.group_by("node_id").len().filter(pl.col("len") > 1)
     if _dup.height:
+        sample = _dup.sort("len", descending=True).head(10).to_dicts()
+        # Also pull the conflicting rows for the first ID so we can see types.
+        first_id = sample[0]["node_id"] if sample else None
+        first_rows = (nodes.filter(pl.col("node_id") == first_id).head(5)
+                      .to_dicts() if first_id else [])
         raise RuntimeError(
-            f"INVARIANT FAIL: {_dup.height} duplicate node_id rows after dedup")
+            f"INVARIANT FAIL: {_dup.height} duplicate node_id rows after dedup. "
+            f"Top dup IDs: {sample}. First dup rows: {first_rows}")
     _null_byte = nodes.filter(~pl.col("node_id").str.contains(":"))
     if _null_byte.height:
         raise RuntimeError(
