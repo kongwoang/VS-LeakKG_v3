@@ -78,7 +78,9 @@ CORPUS_TO_CANONICAL_NODE_TYPE: dict[str, str] = {
     "Protein": NodeType.PROTEIN.value,
     "ProteinTarget": NodeType.PROTEIN.value,
     "ChEMBLAssay": NodeType.ASSAY.value,
+    "Assay": NodeType.ASSAY.value,                # identity: BindingDB-emitted Assay-like records
     "ChEMBLDocument": NodeType.PUBLICATION.value,
+    "Publication": NodeType.PUBLICATION.value,    # identity: BindingDB-emitted PMID/DOI publications
     "DatasetSource": NodeType.DATASET_SOURCE.value,
     "DecoyProtocol": NodeType.DECOY_PROTOCOL.value,
 }
@@ -320,6 +322,165 @@ def _add_protein_cluster_edges(
     return nodes, edges
 
 
+def _wire_reference_provenance(
+    raw_edges: pl.DataFrame,
+    canonical_edges: pl.DataFrame,
+    log: logging.Logger,
+) -> pl.DataFrame:
+    """Synthesize Example -> Assay / Publication / Protein direct edges by
+    collapsing multi-hop paths through the raw KG's ChEMBL Activity and
+    BindingDB record subgraphs.
+
+    The raw kg_edges parquet carries the full reference-DB provenance
+    (chembl_activity_has_assay / _has_document / _has_target,
+    bindingdb_ligand_in_publication / _targets_protein,
+    bindingdb_record_has_ligand / _has_protein), but the canonical schema
+    only encodes single-edge axis relationships. We compose direct edges
+    here so the audit can traverse the assay / publication axes without
+    expanding multi-hop paths every query.
+
+    Returns the canonical edges with new synthetic edges concatenated.
+    Caller is responsible for downstream dedup.
+    """
+    import json as _json
+    # All synthesis chains start with Example -> benchmark Ligand.
+    ex_lig = (raw_edges.filter(pl.col("edge_type") == "example_has_ligand")
+              .select([pl.col("src").alias("example_id"),
+                       pl.col("dst").alias("bench_lid")])
+              .unique())
+    n_synth_pub = n_synth_assay = n_synth_prot = 0
+
+    # ---- ChEMBL chain ----
+    bench_to_chembl = (raw_edges.filter(
+            pl.col("edge_type") == "benchmark_ligand_same_inchikey_as_chembl_ligand")
+        .select([pl.col("src").alias("bench_lid"),
+                 pl.col("dst").alias("chembl_lid")])
+        .unique())
+    if bench_to_chembl.height:
+        chembl_lig_to_act = (raw_edges.filter(
+                pl.col("edge_type") == "chembl_activity_has_ligand")
+            .select([pl.col("dst").alias("chembl_lid"),
+                     pl.col("src").alias("chembl_act_id")])
+            .unique())
+        # Activity -> Document
+        act_doc = (raw_edges.filter(
+                pl.col("edge_type") == "chembl_activity_has_document")
+            .select([pl.col("src").alias("chembl_act_id"),
+                     pl.col("dst").alias("chembl_doc_id")])
+            .unique())
+        if act_doc.height:
+            ex_to_doc = (ex_lig
+                         .join(bench_to_chembl, on="bench_lid", how="inner")
+                         .join(chembl_lig_to_act, on="chembl_lid", how="inner")
+                         .join(act_doc, on="chembl_act_id", how="inner")
+                         .select([pl.col("example_id").alias("src"),
+                                  pl.col("chembl_doc_id").alias("dst")])
+                         .unique())
+            ex_to_doc = ex_to_doc.with_columns([
+                pl.lit(EdgeType.EXAMPLE_FROM_PUBLICATION.value).alias("edge_type"),
+                pl.lit(_json.dumps({"source": "ChEMBL"})).alias("props"),
+            ])
+            canonical_edges = pl.concat([canonical_edges, ex_to_doc],
+                                        how="vertical_relaxed")
+            n_synth_pub += ex_to_doc.height
+
+        # Activity -> Assay
+        act_asy = (raw_edges.filter(
+                pl.col("edge_type") == "chembl_activity_has_assay")
+            .select([pl.col("src").alias("chembl_act_id"),
+                     pl.col("dst").alias("chembl_asy_id")])
+            .unique())
+        if act_asy.height:
+            ex_to_asy = (ex_lig
+                         .join(bench_to_chembl, on="bench_lid", how="inner")
+                         .join(chembl_lig_to_act, on="chembl_lid", how="inner")
+                         .join(act_asy, on="chembl_act_id", how="inner")
+                         .select([pl.col("example_id").alias("src"),
+                                  pl.col("chembl_asy_id").alias("dst")])
+                         .unique())
+            ex_to_asy = ex_to_asy.with_columns([
+                pl.lit(EdgeType.EXAMPLE_FROM_ASSAY.value).alias("edge_type"),
+                pl.lit(_json.dumps({"source": "ChEMBL"})).alias("props"),
+            ])
+            canonical_edges = pl.concat([canonical_edges, ex_to_asy],
+                                        how="vertical_relaxed")
+            n_synth_assay += ex_to_asy.height
+
+    # ---- BindingDB chain ----
+    bench_to_bdb = (raw_edges.filter(
+            pl.col("edge_type") == "benchmark_ligand_same_inchikey_as_bindingdb_ligand")
+        .select([pl.col("src").alias("bench_lid"),
+                 pl.col("dst").alias("bdb_lid")])
+        .unique())
+    if bench_to_bdb.height:
+        # bdb_lig -> Publication
+        bdb_pub = (raw_edges.filter(
+                pl.col("edge_type") == "bindingdb_ligand_in_publication")
+            .select([pl.col("src").alias("bdb_lid"),
+                     pl.col("dst").alias("pub_id")])
+            .unique())
+        if bdb_pub.height:
+            ex_to_bdb_pub = (ex_lig
+                             .join(bench_to_bdb, on="bench_lid", how="inner")
+                             .join(bdb_pub, on="bdb_lid", how="inner")
+                             .select([pl.col("example_id").alias("src"),
+                                      pl.col("pub_id").alias("dst")])
+                             .unique())
+            ex_to_bdb_pub = ex_to_bdb_pub.with_columns([
+                pl.lit(EdgeType.EXAMPLE_FROM_PUBLICATION.value).alias("edge_type"),
+                pl.lit(_json.dumps({"source": "BindingDB"})).alias("props"),
+            ])
+            canonical_edges = pl.concat([canonical_edges, ex_to_bdb_pub],
+                                        how="vertical_relaxed")
+            n_synth_pub += ex_to_bdb_pub.height
+
+        # bdb_lig -> Protein (UniProt)
+        bdb_prot = (raw_edges.filter(
+                pl.col("edge_type") == "bindingdb_ligand_targets_protein")
+            .select([pl.col("src").alias("bdb_lid"),
+                     pl.col("dst").alias("prot_id")])
+            .unique())
+        if bdb_prot.height:
+            ex_to_bdb_prot = (ex_lig
+                              .join(bench_to_bdb, on="bench_lid", how="inner")
+                              .join(bdb_prot, on="bdb_lid", how="inner")
+                              .select([pl.col("example_id").alias("src"),
+                                       pl.col("prot_id").alias("dst")])
+                              .unique())
+            ex_to_bdb_prot = ex_to_bdb_prot.with_columns([
+                pl.lit(EdgeType.EXAMPLE_HAS_PROTEIN.value).alias("edge_type"),
+                pl.lit(_json.dumps({"source": "BindingDB"})).alias("props"),
+            ])
+            canonical_edges = pl.concat([canonical_edges, ex_to_bdb_prot],
+                                        how="vertical_relaxed")
+            n_synth_prot += ex_to_bdb_prot.height
+
+        # bdb_lig -> BindingDB record (Assay-like)
+        bdb_rec = (raw_edges.filter(
+                pl.col("edge_type") == "bindingdb_record_has_ligand")
+            .select([pl.col("dst").alias("bdb_lid"),
+                     pl.col("src").alias("bdb_rec_id")])
+            .unique())
+        if bdb_rec.height:
+            ex_to_bdb_rec = (ex_lig
+                             .join(bench_to_bdb, on="bench_lid", how="inner")
+                             .join(bdb_rec, on="bdb_lid", how="inner")
+                             .select([pl.col("example_id").alias("src"),
+                                      pl.col("bdb_rec_id").alias("dst")])
+                             .unique())
+            ex_to_bdb_rec = ex_to_bdb_rec.with_columns([
+                pl.lit(EdgeType.EXAMPLE_FROM_ASSAY.value).alias("edge_type"),
+                pl.lit(_json.dumps({"source": "BindingDB"})).alias("props"),
+            ])
+            canonical_edges = pl.concat([canonical_edges, ex_to_bdb_rec],
+                                        how="vertical_relaxed")
+            n_synth_assay += ex_to_bdb_rec.height
+
+    log.info("wire_ref_provenance: synth %d publication + %d assay + %d protein edges",
+             n_synth_pub, n_synth_assay, n_synth_prot)
+    return canonical_edges
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -369,9 +530,11 @@ def consolidate(
     # NFS storage where mmap'd scan_parquet causes many small page faults.
     nodes = pl.read_parquet(nodes_path)
     edges = pl.read_parquet(edges_path)
+    raw_edges_full = edges       # preserved for reference-provenance wiring below
     if limit:
         nodes = nodes.head(limit)
         edges = edges.head(limit)
+        raw_edges_full = raw_edges_full.head(limit)
 
     stats.n_nodes_in = nodes.height
     stats.n_edges_in = edges.height
@@ -384,6 +547,12 @@ def consolidate(
     stats.n_edges_dropped = dropped_e
     log.info("mapped: n_nodes=%d (-%d), n_edges=%d (-%d)",
              nodes.height, dropped_n, edges.height, dropped_e)
+
+    # B1+B2+B3: synthesize Example -> Publication / Assay / Protein direct edges
+    # by collapsing multi-hop ChEMBL + BindingDB provenance chains. Done before
+    # the cluster + dangling steps so the new edges participate in dangling
+    # detection and orphan accounting.
+    edges = _wire_reference_provenance(raw_edges_full, edges, log)
 
     nodes, edges = _add_protein_cluster_edges(edges, nodes, processed, stats)
     log.info("after cluster edges: n_nodes=%d, n_edges=%d", nodes.height, edges.height)
@@ -407,30 +576,43 @@ def consolidate(
         log.info("pruned %d dangling edges", pruned)
         stats.deferred = (stats.deferred or []) + [f"pruned_dangling_edges={pruned}"]
 
-    # Drop orphan Protein and ProteinCluster nodes (degree-0 after pruning).
-    # The KG keeps Proteins emitted by BindingDB enrichment for UniProts that
-    # don't touch any benchmark Example, and ProteinClusters whose members'
-    # accessions aren't represented in the KG. Both clutter the canonical
-    # output without contributing audit signal.
-    #
-    # Implementation uses semi-joins instead of `is_in(Series)` (which polars
-    # 1.x deprecated to ambiguous behaviour) so we don't silently keep all
-    # orphans on newer polars.
+    # Universal orphan drop: any node with degree 0 after the dangling-edge
+    # prune is removed. This covers Protein/ProteinCluster (cluster member ids
+    # that don't match KG protein ids), Assay/Publication (when reference-DB
+    # wiring fails to reach them), and any other isolated node accumulated by
+    # the build. The five small-cardinality "structure" types (DatasetSource,
+    # DecoyProtocol, plus everything Example-side) are excluded so a corpus
+    # with zero edges still keeps its DatasetSource pin.
     touched_ids = pl.concat(
         [edges.select(pl.col("src").alias("node_id")),
          edges.select(pl.col("dst").alias("node_id"))],
         how="vertical_relaxed",
     ).unique()
-    orphan_types = {"Protein", "ProteinCluster"}
-    non_orphan_candidates = nodes.filter(~pl.col("node_type").is_in(list(orphan_types)))
-    orphan_candidates = nodes.filter(pl.col("node_type").is_in(list(orphan_types)))
-    kept_orphans = orphan_candidates.join(touched_ids, on="node_id", how="semi")
+    keep_anyway = {"DatasetSource", "DecoyProtocol"}
+    keep_pinned = nodes.filter(pl.col("node_type").is_in(list(keep_anyway)))
+    drop_candidates = nodes.filter(~pl.col("node_type").is_in(list(keep_anyway)))
+    kept_via_edges = drop_candidates.join(touched_ids, on="node_id", how="semi")
     n_before_n = nodes.height
-    nodes = pl.concat([non_orphan_candidates, kept_orphans], how="vertical_relaxed")
+    nodes = pl.concat([keep_pinned, kept_via_edges], how="vertical_relaxed")
     dropped_orphans = n_before_n - nodes.height
     if dropped_orphans:
-        log.info("dropped %d orphan Protein/ProteinCluster nodes", dropped_orphans)
-        stats.deferred = (stats.deferred or []) + [f"dropped_orphan_proteins_clusters={dropped_orphans}"]
+        by_type = (drop_candidates
+                   .join(touched_ids, on="node_id", how="anti")
+                   .group_by("node_type").len()
+                   .sort("len", descending=True))
+        log.info("dropped %d orphan nodes: %s", dropped_orphans,
+                 dict(by_type.iter_rows()))
+        stats.deferred = (stats.deferred or []) + [f"dropped_orphans={dropped_orphans}"]
+
+    # Dedup (src, dst, edge_type) — multiple raw sources can emit the same
+    # logical edge (e.g. per-corpus ligand_similar_to_ligand + D5's
+    # ligand_similar both collapse to LIGAND_SIMILAR). Keep one row per triple.
+    n_before_e = edges.height
+    edges = edges.unique(subset=["src", "dst", "edge_type"], keep="first")
+    deduped = n_before_e - edges.height
+    if deduped:
+        log.info("deduped %d redundant edges on (src, dst, edge_type)", deduped)
+        stats.deferred = (stats.deferred or []) + [f"deduped_redundant_edges={deduped}"]
 
     # Already eager DataFrames at this point.
     nodes_df = nodes
