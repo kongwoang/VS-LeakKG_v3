@@ -565,12 +565,6 @@ def consolidate(
     log.info("mapped: n_nodes=%d (-%d), n_edges=%d (-%d)",
              nodes.height, dropped_n, edges.height, dropped_e)
 
-    # B1+B2+B3: synthesize Example -> Publication / Assay / Protein direct edges
-    # by collapsing multi-hop ChEMBL + BindingDB provenance chains. Done before
-    # the cluster + dangling steps so the new edges participate in dangling
-    # detection and orphan accounting.
-    edges = _wire_reference_provenance(raw_edges_full, edges, log)
-
     nodes, edges = _add_protein_cluster_edges(edges, nodes, processed, stats)
     log.info("after cluster edges: n_nodes=%d, n_edges=%d", nodes.height, edges.height)
 
@@ -583,7 +577,9 @@ def consolidate(
     log.info("flagged %d hub nodes", n_hubs)
 
     # Prune dangling edges (cluster edges typically dangle when corpus-level
-    # Protein ids don't match the UniProt-based cluster member ids).
+    # Protein ids don't match the UniProt-based cluster member ids). Done
+    # BEFORE wiring so the prune only walks the ~19.7M corpus-level edges,
+    # not the ~86M post-wire set.
     _ids = nodes.select("node_id")
     n_before = edges.height
     edges = (edges.join(_ids.rename({"node_id": "src"}), on="src", how="semi")
@@ -592,6 +588,15 @@ def consolidate(
     if pruned:
         log.info("pruned %d dangling edges", pruned)
         stats.deferred = (stats.deferred or []) + [f"pruned_dangling_edges={pruned}"]
+
+    # B1+B2+B3: synthesize Example -> Publication / Assay / Protein direct
+    # edges by collapsing multi-hop ChEMBL + BindingDB provenance chains.
+    # The wire emits edges from Example ids to canonical Doc/Assay/Protein
+    # ids that survived `_map_nodes`, so they don't dangle by construction
+    # and we skip a second prune pass.
+    n_before_wire = edges.height
+    edges = _wire_reference_provenance(raw_edges_full, edges, log)
+    log.info("after wire: n_edges=%d (+%d new)", edges.height, edges.height - n_before_wire)
 
     # Universal orphan drop: any node with degree 0 after the dangling-edge
     # prune is removed. This covers Protein/ProteinCluster (cluster member ids
