@@ -170,6 +170,56 @@ Root cause guess: polars iter_rows(named=True) on >5M-row DataFrames may return 
 
 ---
 
+## Final D5 result (2026-05-30 21:26)
+
+- Sim wall clock: 14,405s (~4 hours) on 16 workers due to CPU contention
+  with another user's process (load avg ~50 throughout). Estimate at full
+  speed would have been ~45 min.
+- 762,842 ligand_similar pairs at Tanimoto ≥ 0.85 (ECFP4, 2048-bit).
+- After `unique()` dedup at consolidate time: **763,653** ligand_similar
+  edges (slight bump because some pairs also surfaced from per-corpus
+  loader's `ligand_similar_to_ligand`).
+- One bug discovered + fixed in `kg/consolidate.py`
+  `CORPUS_TO_CANONICAL_EDGE_TYPE`: the table only mapped
+  `ligand_similar_to_ligand` from per-corpus loaders, so the 762K
+  `ligand_similar` edges emitted directly by `ligand_similarity.py` were
+  being filtered out by `_map_edges`. Added an identity entry for
+  `ligand_similar -> LIGAND_SIMILAR` so both formats survive.
+
+### Final canonical KG (post D5)
+
+| Metric | Value |
+|---|---:|
+| Nodes | 8,634,015 |
+| Edges | 19,592,120 |
+| Example | 5,025,497 |
+| Ligand | 2,013,247 |
+| Scaffold | 645,558 |
+| Assay | 857,115 |
+| Publication | 66,653 |
+| Protein | 6,764 |
+| ProteinCluster | 19,171 |
+| example_has_ligand | 5,025,493 |
+| example_has_protein | 5,025,497 |
+| example_from_source | 5,025,497 |
+| ligand_scaffold | 1,934,033 |
+| source_decoy_protocol | 1,790,563 |
+| **ligand_similar (T ≥ 0.85)** | **763,653** |
+| ligand_exact | 6,939 |
+| ligand_parent_exact | 6,939 |
+| protein_in_cluster | 13,506 |
+
+### Merge audit (raw KG, post D5)
+- Raw kg_nodes: 17,739,452, kg_edges: 65,346,527
+- 4 invariants pass: 0 duplicate node_id, 0 null-byte, 0 dangling src/dst
+- Drift cases (unchanged from pre-D5 audit):
+  - 6,776 InChIKey-level (tautomer/protonation, bridged via `ligand_exact`)
+  - 178,587 parent-skeleton (salt/protonation/stereo, partially bridged via
+    `ligand_parent_exact`)
+  - 324 within-corpus ghost triples (trivial)
+
+---
+
 ## Rebuild from scratch — 2026-05-30 13:05
 
 User instruction: drop pocket axis fully + rebuild clean KG from v3, keep nothing from v2, run merge integrity audit.
