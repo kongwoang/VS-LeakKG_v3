@@ -266,8 +266,8 @@ def _add_protein_cluster_edges(
         # try to find protein-id and cluster-id columns
         col_protein = next(
             (c for c in df.columns
-             if c.lower() in ("protein_id", "pdb_id", "member",
-                              "sequence_id", "seq_id")),
+             if c.lower() in ("accession", "protein_id", "pdb_id", "member",
+                              "sequence_id", "seq_id", "uniprot")),
             None,
         )
         col_cluster = next(
