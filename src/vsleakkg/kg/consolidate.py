@@ -283,7 +283,10 @@ def _add_protein_cluster_edges(
             ]
             continue
         df2 = df.select(
-            pl.col(col_protein).cast(pl.Utf8).alias("member_id"),
+            # Prefix accession with `protein:` so the edge src matches the
+            # Protein node id format used by the BindingDB enrichment step
+            # in task_build_kg (`protein:<UniProt>`).
+            (pl.lit("protein:") + pl.col(col_protein).cast(pl.Utf8)).alias("member_id"),
             pl.col(col_cluster).cast(pl.Utf8).alias("cluster_id"),
         )
         # Synthesise the ProteinCluster nodes (one per cluster_id).
