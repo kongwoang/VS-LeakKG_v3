@@ -42,28 +42,46 @@ from .common import (
 )
 
 
-_LEAK_EDGE_TYPES: tuple[str, ...] = (
-    "example_has_ligand",
-    "example_has_protein",
-    "example_from_publication",
-    "example_from_assay",
-    "ligand_similar",
-    "ligand_exact",
-    "ligand_parent_exact",
-    "ligand_fingerprint_exact",
-    "ligand_scaffold",
-    "protein_in_cluster",
-)
+# Per-axis leak edge sets. Within a single corpus, example_has_protein
+# trivially connects every example to every other in 2 hops via shared
+# target — that saturates the horizon curve to a single bin. To get a
+# meaningful curve we measure distance through the *ligand* axis only
+# (every example reaches its train neighbour via shared ligand → scaffold
+# → similar ligand → ...) and report it alongside the all-axis distance
+# for completeness.
+_AXIS_EDGE_SETS: dict[str, tuple[str, ...]] = {
+    "ligand_axis": (
+        "example_has_ligand",
+        "ligand_similar", "ligand_exact", "ligand_parent_exact",
+        "ligand_fingerprint_exact", "ligand_scaffold",
+    ),
+    "all": (
+        "example_has_ligand", "example_has_protein",
+        "example_from_publication", "example_from_assay",
+        "ligand_similar", "ligand_exact", "ligand_parent_exact",
+        "ligand_fingerprint_exact", "ligand_scaffold", "protein_in_cluster",
+    ),
+}
+# Back-compat default.
+_LEAK_EDGE_TYPES: tuple[str, ...] = _AXIS_EDGE_SETS["all"]
 
 
 def annotate_distances(
     preds: pl.DataFrame, kg_dir: Path, max_hop: int,
     schema: PredictionSchema | None = None,
+    axis: str = "ligand_axis",
 ) -> pl.DataFrame:
+    """Annotate each test prediction with its BFS distance to the nearest
+    train item over the given `axis` edge set.
+
+    Defaults to `ligand_axis` to avoid the protein-axis saturation that
+    pegs every test to hop=2 in any single-corpus split.
+    """
     s = schema or PredictionSchema()
     train_df, test_df = split_train_test(preds, s)
     _, edges = load_canonical_kg(kg_dir)
-    leak = edges.filter(pl.col("edge_type").is_in(list(_LEAK_EDGE_TYPES))).select(["src", "dst"])
+    etypes = list(_AXIS_EDGE_SETS.get(axis, _LEAK_EDGE_TYPES))
+    leak = edges.filter(pl.col("edge_type").is_in(etypes)).select(["src", "dst"])
     train_ids = train_df.select(pl.col(s.example_id).alias("node_id")).unique()
     reached = bfs_distance(train_ids, leak, max_hop=max_hop)
     examples = load_examples(kg_dir).select(["node_id", "source"])
@@ -71,6 +89,7 @@ def annotate_distances(
         test_df.rename({s.example_id: "node_id"})
         .join(reached, on="node_id", how="left")
         .join(examples, on="node_id", how="left")
+        .with_columns(pl.lit(axis).alias("axis"))
     )
 
 
@@ -105,20 +124,30 @@ def run(args: argparse.Namespace) -> None:
     out.mkdir(parents=True, exist_ok=True)
     schema = PredictionSchema()
     preds = load_predictions(args.predictions, schema)
-    annotated = annotate_distances(preds, Path(args.kg_dir), args.max_hop, schema)
+    annotated_parts: list[pl.DataFrame] = []
+    curve_parts: list[pl.DataFrame] = []
+    for axis in _AXIS_EDGE_SETS:
+        a = annotate_distances(preds, Path(args.kg_dir), args.max_hop, schema, axis=axis)
+        c = horizon_curve(a, schema).with_columns(pl.lit(axis).alias("axis"))
+        annotated_parts.append(a)
+        curve_parts.append(c)
+    annotated = pl.concat(annotated_parts, how="vertical_relaxed")
+    curve = pl.concat(curve_parts, how="vertical_relaxed")
     annotated.write_parquet(out / "per_test_distance.parquet")
-    curve = horizon_curve(annotated, schema)
     curve.write_csv(out / "auroc_by_hop.csv")
 
     lines = ["# Mảng E — Generalization horizon curve", ""]
-    n_test = annotated.height
-    n_reached = int(annotated.filter(pl.col("hop").is_not_null()).height)
+    n_test = preds.filter(pl.col(schema.fold) == "test").height
     lines.append(f"- test items: {n_test:,}")
-    lines.append(f"- reachable within ≤{args.max_hop} hops of any train: "
-                 f"{n_reached:,} ({100*n_reached/max(n_test,1):.1f}%)")
-    lines.append("")
-    lines.append("## AUROC by KG distance to nearest train")
-    lines.append(curve.to_pandas().round(3).to_markdown(index=False))
+    for axis in _AXIS_EDGE_SETS:
+        a_sub = annotated.filter(pl.col("axis") == axis)
+        c_sub = curve.filter(pl.col("axis") == axis)
+        n_reached = int(a_sub.filter(pl.col("hop").is_not_null()).height)
+        lines.append("")
+        lines.append(f"## axis = {axis}")
+        lines.append(f"- reachable within ≤{args.max_hop} hops: "
+                     f"{n_reached:,} ({100*n_reached/max(a_sub.height,1):.1f}%)")
+        lines.append(c_sub.to_pandas().round(3).to_markdown(index=False))
     (out / "report.md").write_text("\n".join(lines), encoding="utf-8")
     print(f"wrote {out}/per_test_distance.parquet")
     print(f"wrote {out}/auroc_by_hop.csv ({curve.height} rows)")

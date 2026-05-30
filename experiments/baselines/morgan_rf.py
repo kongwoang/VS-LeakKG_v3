@@ -60,11 +60,23 @@ def train_and_score(
         n_estimators=n_estimators, n_jobs=-1, random_state=seed
     )
     clf.fit(X_train, y_train)
+    print(f"trained RF, scoring {hydrated.height} rows in batches...", flush=True)
 
-    X_all, _ = morgan_fingerprints(
-        hydrated["smiles"].to_list(), n_bits=n_bits, radius=radius
-    )
-    scores = clf.predict_proba(X_all)[:, 1].astype(np.float64)
+    # Batched scoring keeps the fingerprint array under a few GB even on
+    # 2.6M-row corpora like LIT-PCBA, where a single big array would peak
+    # at ~5 GB (2048 bits × uint8 × 2.6M) plus per-batch RDKit overhead.
+    batch_size = 100_000
+    all_smiles = hydrated["smiles"].to_list()
+    n = len(all_smiles)
+    scores_chunks: list[np.ndarray] = []
+    for i in range(0, n, batch_size):
+        batch = all_smiles[i:i + batch_size]
+        X_batch, _ = morgan_fingerprints(batch, n_bits=n_bits, radius=radius)
+        s = clf.predict_proba(X_batch)[:, 1].astype(np.float64)
+        scores_chunks.append(s)
+        if (i // batch_size) % 5 == 0:
+            print(f"  scored {min(i + batch_size, n):,} / {n:,}", flush=True)
+    scores = np.concatenate(scores_chunks)
     return hydrated.with_columns(pl.Series("score", scores))
 
 
