@@ -84,55 +84,55 @@ def cnn_score(
     print(f"train={train_ids.height:,}, test={test_ids.height:,}", flush=True)
 
     # ---- k=1: direct neighbours via fwd + bwd joins (no symmetrise) ----
-    # forward: edges where src is a test, dst is a train
+    # forward: leak.src ∈ test, leak.dst ∈ train
     fwd = (leak.join(test_ids.rename({"example_id": "src"}), on="src", how="semi")
-               .rename({"src": "test_id", "dst": "nbr"})
-               .join(train_ids.rename({"example_id": "nbr",
+               .join(train_ids.rename({"example_id": "dst",
                                        "train_label": "tl"}),
-                     on="nbr", how="inner")
-               .select(["test_id", "tl"]))
+                     on="dst", how="inner")
+               .select([pl.col("src").alias("test_id"), pl.col("tl")]))
+    # backward: leak.dst ∈ test, leak.src ∈ train
     bwd = (leak.join(test_ids.rename({"example_id": "dst"}), on="dst", how="semi")
-               .rename({"dst": "test_id", "src": "nbr"})
-               .join(train_ids.rename({"example_id": "nbr",
+               .join(train_ids.rename({"example_id": "src",
                                        "train_label": "tl"}),
-                     on="nbr", how="inner")
-               .select(["test_id", "tl"]))
+                     on="src", how="inner")
+               .select([pl.col("dst").alias("test_id"), pl.col("tl")]))
     one_hop = pl.concat([fwd, bwd], how="vertical_relaxed").unique()
     print(f"  1-hop test→train edges: {one_hop.height:,}", flush=True)
 
     score_parts = [one_hop.with_columns(pl.lit(1, dtype=pl.Int64).alias("hop"))]
     if k_hop >= 2:
-        # 2-hop: find all (test_id, intermediate) edges, then (intermediate, train_id)
+        # 2-hop: (test_id, mid) where mid is some intermediate non-train node.
         inter_fwd = (leak.join(test_ids.rename({"example_id": "src"}),
                                on="src", how="semi")
-                         .rename({"src": "test_id", "dst": "mid"}))
+                         .select([pl.col("src").alias("test_id"),
+                                  pl.col("dst").alias("mid")]))
         inter_bwd = (leak.join(test_ids.rename({"example_id": "dst"}),
                                on="dst", how="semi")
-                         .rename({"dst": "test_id", "src": "mid"}))
+                         .select([pl.col("dst").alias("test_id"),
+                                  pl.col("src").alias("mid")]))
         inter = pl.concat([inter_fwd, inter_bwd], how="vertical_relaxed").unique()
-        # Remove intermediates that are themselves train (we already have
-        # those via 1-hop).
-        inter = inter.join(train_ids.rename({"example_id": "mid"}),
+        # Drop intermediates that are themselves train (those edges already
+        # counted as 1-hop).
+        inter = inter.join(train_ids.select(pl.col("example_id").alias("mid")),
                            on="mid", how="anti")
         print(f"  2-hop intermediates: {inter.height:,}", flush=True)
 
-        # From intermediate to train (any direction).
-        mid_to_train_fwd = (leak.join(inter.select("mid").unique()
-                                          .rename({"mid": "src"}),
+        mid_set = inter.select("mid").unique()
+        # mid -> train via either direction.
+        mid_to_train_fwd = (leak.join(mid_set.rename({"mid": "src"}),
                                        on="src", how="semi")
-                                .rename({"src": "mid", "dst": "nbr"})
-                                .join(train_ids.rename({"example_id": "nbr",
+                                .join(train_ids.rename({"example_id": "dst",
                                                         "train_label": "tl"}),
-                                      on="nbr", how="inner")
-                                .select(["mid", "tl"]))
-        mid_to_train_bwd = (leak.join(inter.select("mid").unique()
-                                          .rename({"mid": "dst"}),
+                                      on="dst", how="inner")
+                                .select([pl.col("src").alias("mid"),
+                                         pl.col("tl")]))
+        mid_to_train_bwd = (leak.join(mid_set.rename({"mid": "dst"}),
                                        on="dst", how="semi")
-                                .rename({"dst": "mid", "src": "nbr"})
-                                .join(train_ids.rename({"example_id": "nbr",
+                                .join(train_ids.rename({"example_id": "src",
                                                         "train_label": "tl"}),
-                                      on="nbr", how="inner")
-                                .select(["mid", "tl"]))
+                                      on="src", how="inner")
+                                .select([pl.col("dst").alias("mid"),
+                                         pl.col("tl")]))
         mid_to_train = pl.concat([mid_to_train_fwd, mid_to_train_bwd],
                                  how="vertical_relaxed").unique()
         two_hop = (inter.join(mid_to_train, on="mid", how="inner")
