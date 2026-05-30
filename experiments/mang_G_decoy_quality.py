@@ -62,39 +62,53 @@ def run(args: argparse.Namespace) -> None:
         {"node_id": "ex"}
     )
     ex_target = _example_target_map(kg_dir)
-    # Decoy view: corpus example with label == 0.
-    decoys = (examples.filter(pl.col("label") == 0)
-              .join(ex_target, on="ex", how="left"))
-    actives = (examples.filter(pl.col("label") == 1)
-               .join(ex_target, on="ex", how="left"))
-
-    lig_assay = _ligand_to_assays(kg_dir)
     ex_lig = edges_of_types(["example_has_ligand"], kg_dir).select(["src", "dst"]).rename(
         {"src": "ex", "dst": "lig"}
     )
 
-    decoy_with_lig = decoys.join(ex_lig, on="ex", how="left")
-    active_with_lig = actives.join(ex_lig, on="ex", how="left")
+    # Build (lig, target) pairs for actives — small (~500K) and pre-deduped.
+    active_lig_target = (
+        examples.filter(pl.col("label") == 1)
+        .join(ex_target, on="ex", how="inner")
+        .join(ex_lig, on="ex", how="inner")
+        .select(["lig", pl.col("target").alias("active_target"),
+                 pl.col("source").alias("active_source")])
+        .unique()
+    )
+    print(f"active (lig,target) pairs: {active_lig_target.height:,}", flush=True)
 
-    # An active is "real activity elsewhere" if its ligand appears in an
-    # example whose target ≠ the decoy's target AND the example is labelled
-    # active.
-    other_active = (active_with_lig.select(
-        ["lig", pl.col("target").alias("other_target"),
-         pl.col("source").alias("other_source")]
-    ).unique())
+    # Build (decoy_id, lig, target) for every decoy.
+    decoy_pairs = (
+        examples.filter(pl.col("label") == 0)
+        .join(ex_target, on="ex", how="inner")
+        .join(ex_lig, on="ex", how="inner")
+        .select([pl.col("ex").alias("decoy_id"),
+                 pl.col("source").alias("decoy_source"),
+                 pl.col("target").alias("decoy_target"),
+                 "lig"])
+    )
+    print(f"decoy (id,lig,target): {decoy_pairs.height:,}", flush=True)
 
-    decoy_join = (decoy_with_lig.join(other_active, on="lig", how="left")
-                  .filter(pl.col("other_target").is_not_null()
-                          & (pl.col("other_target") != pl.col("target"))))
+    # The join: for each decoy, look up actives sharing the same ligand
+    # but a DIFFERENT target. Pre-aggregating actives per ligand keeps the
+    # join from exploding (a ligand active on N targets joins N times, not
+    # N × #decoys-with-same-lig as the naive cross-product would).
+    decoy_join = (
+        decoy_pairs.join(active_lig_target, on="lig", how="inner")
+        .filter(pl.col("active_target") != pl.col("decoy_target"))
+    )
+    print(f"decoy×active intersect (diff target): {decoy_join.height:,}", flush=True)
 
-    per_decoy = (decoy_join.group_by(["ex", "source", "target"])
+    per_decoy = (decoy_join.group_by(["decoy_id", "decoy_source", "decoy_target"])
                  .agg([
-                     pl.col("other_target").n_unique().alias("n_other_targets"),
-                     pl.col("other_target").first().alias("sample_other_target"),
-                     pl.col("other_source").first().alias("sample_other_source"),
-                 ])
-                 .rename({"ex": "decoy_id", "target": "decoy_target"}))
+                     pl.col("active_target").n_unique().alias("n_other_targets"),
+                     pl.col("active_target").first().alias("sample_other_target"),
+                     pl.col("active_source").first().alias("sample_other_source"),
+                 ]))
+    # Rename for output compatibility.
+    per_decoy = per_decoy.rename({"decoy_source": "source", "decoy_target": "target"})
+    decoys = examples.filter(pl.col("label") == 0)  # for summary count
+    print(f"per_decoy unique rows: {per_decoy.height:,}", flush=True)
     per_decoy.write_parquet(out / "decoy_with_real_activity.parquet")
 
     summary = (decoys.group_by("source").agg([
