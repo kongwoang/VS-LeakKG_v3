@@ -218,6 +218,73 @@ Root cause guess: polars iter_rows(named=True) on >5M-row DataFrames may return 
     `ligand_parent_exact`)
   - 324 within-corpus ghost triples (trivial)
 
+## Post-anomaly fixes (2026-05-30 23:00)
+
+### Anomalies surfaced by the final sanity check
+1. 314,683 `ligand_similar` pairs at Tanimoto = 1.0 — same molecule modulo
+   stereo / tautomer that ECFP4 (radius=2) doesn't encode. Audit was
+   underweighting these as similarity (0.65) when they should be near-
+   identity (0.95).
+2. 841 orphan Protein + 10,442 orphan ProteinCluster nodes (degree 0
+   after dangling-edge prune).
+3. 453 `ligand_similar` rows whose Tanimoto < 0.85 — turned out to be
+   per-corpus loader edges with threshold 0.81-0.84, not a parse failure.
+   No action.
+
+### Fixes
+- New `EdgeType.LIGAND_FINGERPRINT_EXACT` (`ligand_fingerprint_exact`),
+  weight 0.95, in the "ligand" axis. `ligand_similarity.py` emits this
+  edge type when Tanimoto >= 0.9995; `ligand_similar` for T < 0.9995.
+  Re-labeled the existing 314,683 edges in place (no recompute).
+- `kg.consolidate`: drop orphan Protein and ProteinCluster nodes via a
+  semi-join (switched from `is_in(Series)` which polars 1.x had
+  deprecated to ambiguous behaviour and silently kept all orphans).
+
+### Final canonical KG (post fixes)
+
+| Metric | Value |
+|---|---:|
+| Nodes | **8,622,732** |
+| Edges | **19,592,120** |
+| Example | 5,025,497 |
+| Ligand | 2,013,247 |
+| Scaffold | 645,558 |
+| Assay | 857,115 |
+| Publication | 66,653 |
+| Protein | 5,923 (orphans dropped) |
+| ProteinCluster | 8,729 (orphans dropped) |
+| ligand_exact | 6,939 |
+| ligand_parent_exact | 6,939 |
+| **ligand_fingerprint_exact** | **314,683** (NEW) |
+| ligand_similar (T 0.85..0.9995) | 448,970 |
+| protein_in_cluster | 13,506 |
+
+### Per-dataset contribution
+
+| Corpus | Examples | Actives | Decoys/Inactives | Decoy:Active |
+|---|---:|---:|---:|---:|
+| LIT-PCBA | 2,651,977 | 7,955 | 2,644,022 | 332:1 |
+| DUD-E | 1,434,019 | 22,805 | 1,411,214 | 62:1 |
+| BigBind | 582,957 | 489,733 | 93,224 | 0.19:1 (training set) |
+| BayesBind | 260,876 | 10,876 | 250,000 | 23:1 |
+| DEKOIS | 95,668 | 3,239 | 92,429 | 28:1 |
+
+| Corpus | Unique Ligands | Unique Proteins |
+|---|---:|---:|
+| DUD-E | 1,200,431 | 102 |
+| BigBind | 399,090 | 1,173 |
+| LIT-PCBA | 382,742 | 15 |
+| DEKOIS | 87,954 | 81 |
+| BayesBind | 21,037 | 50 |
+
+Cross-corpus ligand overlap (leakage signal):
+- 1,942,516 ligands exclusive to one corpus
+- 63,757 in 2 corpora
+- 6,686 in 3 corpora
+- 274 in 4 corpora
+- 14 in all 5 corpora
+- **70,731 ligands (3.5%) cross at least two corpora**
+
 ---
 
 ## Rebuild from scratch — 2026-05-30 13:05
