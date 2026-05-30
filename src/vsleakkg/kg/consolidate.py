@@ -99,6 +99,7 @@ CORPUS_TO_CANONICAL_EDGE_TYPE: dict[str, str] = {
     "example_from_source": EdgeType.EXAMPLE_FROM_SOURCE.value,
     "ligand_has_scaffold": EdgeType.LIGAND_SCAFFOLD.value,
     "ligand_similar_to_ligand": EdgeType.LIGAND_SIMILAR.value,
+    "ligand_similar": EdgeType.LIGAND_SIMILAR.value,    # ligand_similarity.py emits this name directly
     "same_inchikey_as": EdgeType.LIGAND_EXACT.value,
     "same_parent_inchikey_as": EdgeType.LIGAND_PARENT_EXACT.value,
     "example_uses_decoy_protocol": EdgeType.SOURCE_DECOY_PROTOCOL.value,
