@@ -391,3 +391,109 @@ Case 3 is the only material concern. Fix would require salt-stripping pre-canoni
 ## Edits committed
 
 (populated as phases complete)
+
+## Phase 6 — canonical KG wired + cleaned (2026-05-31 00:34)
+
+After the merge audit surfaced 3 issues in the post-Phase-5 canonical KG
+(923K orphan Assay/Publication, 5 silently-dropped node types incl.
+ChEMBLLigand / BindingDBLigand / ChEMBLTarget, 131 duplicate
+ligand_similar edges), this phase reworked `vsleakkg.kg.consolidate` to:
+
+1. Add identity mappings for `Assay` and `Publication` to
+   `CORPUS_TO_CANONICAL_NODE_TYPE` so direct BindingDB Assay/Publication
+   nodes survive instead of being silently dropped.
+2. Wire `_wire_reference_provenance()` to collapse the multi-hop
+   reference-DB provenance chains down to direct Example→ref edges:
+   - ChEMBL chain: `Example → benchLig → ChEMBLLig → Activity → Doc` →
+     emit `example_from_publication`
+   - ChEMBL chain: `Example → benchLig → ChEMBLLig → Activity → Assay` →
+     emit `example_from_assay` (capped at 5 assays per benchmark Ligand
+     to bound memory; ChEMBL has many assays per molecule)
+   - BindingDB chain: `Example → benchLig → BDBLig → publication` →
+     emit `example_from_publication`
+   - BindingDB chain: `Example → benchLig → BDBLig → UniProt` →
+     emit `example_has_protein` (canonical UniProt anchor)
+3. Universal orphan drop (any node type except `DatasetSource` and
+   `DecoyProtocol`) via semi-join — the previous `is_in(Series)` form
+   silently kept all orphans because polars 1.x deprecated that
+   signature.
+4. Targeted dedup on `ligand_similar` only — global
+   `unique(subset=[src,dst,edge_type])` on the 38M-edge frame OOMs at
+   the 22 GB free RAM available; every other edge type has unique
+   (src,dst) by construction, so only the 448K ligand_similar subset
+   needs dedup.
+5. Time axis explicitly skipped (`TimeBin` / `TrainSet` /
+   `example_has_timebin` / `time_overlap` left unused) — user confirmed
+   the audit can run without temporal partitioning.
+
+### Final canonical KG
+
+| Metric | Value |
+|---|---:|
+| Nodes total | **7,951,307** |
+| Edges total | **38,888,212** |
+| Example | 5,025,497 |
+| Ligand | 2,013,247 |
+| Scaffold | 645,555 |
+| Assay (post-wire, cap=5) | 158,239 |
+| Publication (post-wire) | 93,266 |
+| ProteinCluster | 8,729 |
+| Protein (UniProt) | 6,764 |
+| DatasetSource | 7 |
+| DecoyProtocol | 3 |
+
+### Wired-axis edge counts
+
+| Edge type | Count | Source |
+|---|---:|---|
+| example_from_assay | **10,318,968** | wired (ChEMBL Activity, cap=5) |
+| example_has_protein | 8,221,977 | direct + wired (BindingDB UniProt) |
+| example_from_publication | **5,780,785** | wired (ChEMBL Doc + BindingDB pub) |
+| example_from_source | 5,025,497 | direct |
+| example_has_ligand | 5,025,493 | direct |
+| ligand_scaffold | 1,934,033 | direct |
+| source_decoy_protocol | 1,790,563 | direct |
+| ligand_similar | 448,829 | similarity D5 |
+| ligand_fingerprint_exact | 314,683 | T=1.0 stereo dup relabel |
+| protein_in_cluster | 13,506 | MMseqs2 @ 30/50/90% |
+| ligand_parent_exact | 6,939 | salt-stripped InChIKey |
+| ligand_exact | 6,939 | full InChIKey |
+
+### Per-corpus contribution
+
+| Corpus | Actives | Decoys | Decoy/Active | Unique Ligands | Unique Proteins |
+|---|---:|---:|---:|---:|---:|
+| LIT-PCBA | 7,955 | 2,644,022 | 332.4 | 382,742 | 2,313 |
+| DUD-E | 22,805 | 1,411,214 | 61.9 | 1,200,431 | 2,312 |
+| BigBind | 489,733 | 93,224 | 0.19 (training corpus) | 399,090 | 6,365 |
+| DEKOIS | 3,239 | 92,429 | 28.5 | 87,954 | 1,227 |
+| BayesBind | 10,876 | 250,000 | 23.0 | 21,037 | 2,588 |
+
+Ligand cross-corpus sharing: 1.94M unique to one corpus, 63.8K shared
+across 2, 6.7K across 3, 274 across 4, 14 across all 5 corpora.
+
+### Invariants (final_verify.py)
+
+- duplicate node_id: 0
+- node_id missing ':': 0
+- dangling src: 0
+- dangling dst: 0
+- duplicate (src, dst, edge_type): 0
+- self-loops: 0
+- endpoint type mismatch (10 edge-types checked): 0
+- orphan nodes (canonical, excluding pinned DatasetSource/DecoyProtocol):
+  2 (both DatasetSource — empty corpora loaders)
+
+### Pipeline runtime (Phase 6 consolidate)
+
+- read raw: 0.5s (65.3M edges, 17.7M nodes)
+- map + dedup nodes: 0.4s (-8.3M nodes, -45.7M edges via lossy drops)
+- cluster edges: 0.1s
+- trivial scaffolds: 0.3s (-343 scaffolds with ≤6 heavy atoms)
+- hub flag: 6.2s (407 hub nodes)
+- dangling prune: 1.5s
+- wire reference provenance: 11.2s (+19.3M edges)
+- orphan drop: 4.3s (-1.49M orphans)
+- ligand_similar dedup: 0.1s (-141 dups)
+- write parquet: 5.8s
+- **total: 37.9s** for 38.9M-edge canonical KG
