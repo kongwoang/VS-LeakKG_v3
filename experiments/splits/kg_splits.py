@@ -56,12 +56,19 @@ def build_kg_kdisjoint(
     test_ratio: float = 0.15,
     K: int = 2,
     max_iter: int = 3,
+    axes: str | None = None,
 ) -> SplitResult:
     """Iterative: random init → BFS from train ≤K hops → flip reached test
     items to train. Stops when no more flips or max_iter reached.
+
+    `axes` (comma-separated subset of {ligand, scaffold, protein,
+    publication, assay}) controls which subgraph is walked. Default =
+    all. To exclude protein (which trivially saturates K=2 within a
+    corpus), pass axes="ligand,scaffold,publication,assay".
     """
     out = stratified_random_assign(examples, test_ratio=test_ratio, seed=seed)
-    leak = _load_leak_edges(kg_dir)
+    axis_tuple = tuple(axes.split(",")) if axes else None
+    leak = _load_leak_edges(kg_dir, axes=axis_tuple)
     flipped_total = 0
     for _ in range(max_iter):
         train_ids = out.filter(pl.col("fold") == "train").select("node_id")
@@ -93,6 +100,7 @@ def build_kg_maxmin(
     test_ratio: float = 0.15,
     T: int = 2,
     max_iter: int = 5,
+    axes: str | None = None,
 ) -> SplitResult:
     """Multi-axis MaxMin: random init → iteratively prune the closest
     train-test pairs until min KG distance ≥ T.
@@ -102,7 +110,8 @@ def build_kg_maxmin(
     the central contribution.
     """
     out = stratified_random_assign(examples, test_ratio=test_ratio, seed=seed)
-    leak = _load_leak_edges(kg_dir)
+    axis_tuple = tuple(axes.split(",")) if axes else None
+    leak = _load_leak_edges(kg_dir, axes=axis_tuple)
     flipped_total = 0
     for _ in range(max_iter):
         train_ids = out.filter(pl.col("fold") == "train").select("node_id")

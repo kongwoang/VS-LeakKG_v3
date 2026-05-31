@@ -38,13 +38,14 @@ PARAM_SWEEPS: dict[str, list[dict[str, Any]]] = {
         {"identity": 90},
     ],
     "kg_kdisjoint": [
-        {"K": 1},
-        {"K": 2},
-        {"K": 3},
+        {"K": 2, "axes": "ligand,scaffold,publication,assay"},
+        {"K": 3, "axes": "ligand,scaffold,publication,assay"},
+        {"K": 2},  # all axes incl. protein — likely empty test
     ],
     "kg_maxmin": [
-        {"T": 2},
-        {"T": 3},
+        {"T": 2, "axes": "ligand,scaffold,publication,assay"},
+        {"T": 3, "axes": "ligand,scaffold,publication,assay"},
+        {"T": 2},  # all axes incl. protein
     ],
     "kg_axis_budget": [
         {"K": 2},
