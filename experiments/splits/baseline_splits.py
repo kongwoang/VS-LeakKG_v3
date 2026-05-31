@@ -111,10 +111,17 @@ def build_scaffold_generic(
     # via RDKit's MakeScaffoldGeneric (replaces all heavy atoms with carbon
     # and erases bond orders). Falls back to the BM scaffold itself when
     # RDKit can't parse it.
+    # Restrict the RDKit compute to scaffolds actually used by THIS corpus's
+    # examples — otherwise we'd run MakeScaffoldGeneric on all 645K KG
+    # scaffolds, which dominates wall time (~15 min on DEKOIS for what
+    # should be a <30s operation).
     from ..common import load_canonical_kg
+    used = ex_scaf.select("scaffold").drop_nulls().unique()
     nodes, _ = load_canonical_kg(kg_dir)
-    scaf_nodes = nodes.filter(pl.col("node_type") == "Scaffold").select(
-        ["node_id", "label"]).rename({"node_id": "scaffold", "label": "smi"})
+    scaf_nodes = (nodes.filter(pl.col("node_type") == "Scaffold")
+                  .select(["node_id", "label"])
+                  .rename({"node_id": "scaffold", "label": "smi"})
+                  .join(used, on="scaffold", how="semi"))
 
     def _generic(smi: str) -> str:
         try:
@@ -130,7 +137,6 @@ def build_scaffold_generic(
         except Exception:
             return smi
 
-    # Vectorise via map_elements; cheap because scaffold count is ≤1M.
     scaf_nodes = scaf_nodes.with_columns(
         pl.col("smi").map_elements(_generic, return_dtype=pl.Utf8).alias("generic"))
     ex_scaf = (ex_scaf.join(scaf_nodes.select(["scaffold", "generic"]),
