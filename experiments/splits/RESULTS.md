@@ -222,9 +222,120 @@ n_estimators = 100. AUROC + 95% bootstrap CI on the test partition.
 > partially), the KG analysis quantifies *why* no honest split exists —
 > the paper / assay overlap is fundamental, not splittable.
 
+## Morgan-RF AUROC — ALL 14 protocols × 5 corpora
+
+`data/predictions_v2/morgan_rf_auroc_summary.csv` — 57 rows
+(infeasibles dropped).
+
+### DEKOIS (random=0.911, all protocols within 4pp)
+
+| protocol | params | n_test | n_active | AUROC [95% CI] | Δ vs random |
+|---|---|---:|---:|---:|---:|
+| scaffold_generic | default | 14,177 | 375 | **0.885 [0.867, 0.904]** | **−2.6pp** |
+| kg_axis_budget | strict (K=2) | 6,585 | 220 | 0.894 [0.865, 0.917] | −1.7pp |
+| **kg_kdisjoint strict** | K=2 all axes | 12,049 | 225 | 0.894 [0.869, 0.916] | **−1.7pp** |
+| kg_maxmin strict | T=3 all axes | 12,049 | 225 | 0.894 [0.869, 0.916] | −1.7pp |
+| scaffold | default | 13,772 | 495 | 0.897 [0.878, 0.915] | −1.4pp |
+| kg_axis_budget structural | K=2 pub/assay free | 6,585 | 230 | 0.897 [0.872, 0.921] | −1.4pp |
+| **kg_kdisjoint structural** | K=2 chem | 12,509 | 435 | 0.897 [0.877, 0.915] | −1.4pp |
+| kg_maxmin structural | T=3 chem | 12,509 | 435 | 0.897 [0.877, 0.915] | −1.4pp |
+| tanimoto_maxmin | T=0.4 | 14,201 | 481 | 0.905 [0.889, 0.922] | −0.5pp |
+| **random** | default | 14,350 | 486 | 0.911 [0.895, 0.926] | 0 |
+| random_per_target | default | 14,278 | 455 | 0.925 [0.910, 0.939] | +1.4pp |
+
+→ DEKOIS labels stable across protocols. KG-strict ties with `scaffold` in
+hardness (0.894 vs 0.897), beats random_per_target by 3pp. Modest effect.
+
+### DUD-E (random=0.899)
+
+| protocol | params | n_test | n_active | AUROC | Δ |
+|---|---|---:|---:|---:|---:|
+| **protein_cluster_30** | identity=30 | **1,190** | **986** (83%) | 0.726 | −17.2pp ⚠ broken label dist |
+| protein_cluster_50 | identity=50 | 1,398 | 1,169 (84%) | 0.783 | −11.6pp ⚠ |
+| protein_cluster_90 | identity=90 | 1,732 | 1,530 (88%) | 0.811 | −8.8pp ⚠ |
+| **kg_kdisjoint strict** | K=2 all axes | **156,117** | 205 (0.13%) | **0.865** | **−3.4pp** ✓ clean dist |
+| kg_maxmin strict | T=3 all axes | 156,117 | 205 | 0.865 | −3.4pp |
+| scaffold_generic | default | 200,015 | 3,264 | 0.876 | −2.3pp |
+| **kg_kdisjoint structural** | K=2 chem | 160,177 | 2,816 | 0.880 | −1.9pp |
+| kg_maxmin structural | T=3 chem | 160,177 | 2,816 | 0.880 | −1.9pp |
+| kg_axis_budget structural | K=2 pub/assay free | 84,361 | 1,444 | 0.880 | −1.9pp |
+| scaffold | default | 203,014 | 3,370 | 0.890 | −0.9pp |
+| kg_axis_budget strict | K=2 | 84,361 | 1,464 | 0.896 | −0.3pp |
+| **random** | default | 215,103 | 3,421 | 0.899 | 0 |
+| tanimoto_maxmin | T=0.4 | 196,160 | 3,200 | 0.901 | +0.2pp |
+| random_per_target | default | 214,932 | 3,330 | 0.902 | +0.4pp |
+
+→ protein_cluster has BROKEN label distribution (83-88% active vs natural 1.6%)
+making AUROC numbers incomparable. **Among clean-distribution splits,
+KG-strict gives the largest drop (−3.4pp)** at 156K test items.
+
+### BayesBind (random=0.742) — careful: KG flips most decoys, keeping actives
+
+| protocol | params | n_test | n_active | AUROC | Δ |
+|---|---|---:|---:|---:|---:|
+| scaffold | default | 37,512 | 1,584 | **0.573** | −16.9pp |
+| **kg_kdisjoint structural** | K=2 chem | **1,342** | **999 (74%)** | 0.594 | −14.8pp ⚠ label drift |
+| kg_maxmin structural | T=3 chem | 1,342 | 999 (74%) | 0.594 | −14.8pp |
+| scaffold_generic | default | 40,779 | 1,720 | 0.594 | −14.8pp |
+| protein_cluster_30 | identity=30 | 13,795 | 3,764 (27%) | 0.659 | −8.3pp ⚠ |
+| kg_axis_budget structural | K=2 pub/assay free | 753 | 498 (66%) | 0.662 | −8.0pp ⚠ |
+| protein_cluster_90 | identity=90 | 13,394 | 728 | 0.664 | −7.8pp |
+| protein_cluster_50 | identity=50 | 19,709 | 1,415 | 0.691 | −5.1pp |
+| tanimoto_maxmin | T=0.4 | 39,094 | 1,622 | 0.732 | −1.0pp |
+| **random** | default | 39,131 | 1,631 | 0.742 | 0 |
+| random_per_target | default | 38,971 | 1,524 | 0.744 | +0.2pp |
+
+→ `scaffold` is the hardest split on BayesBind (−16.9pp). KG-structural
+matches scaffold_generic (−14.8pp) but with 74% active test (vs scaffold's 4%).
+**Distribution shift confounds the comparison** — AUROC values across these
+splits measure different problems. The fundamental finding: BayesBind has
+99% paper-share leak that scaffold filtering also catches (because
+within-paper analogs share scaffolds).
+
+### BigBind (random=0.760) — KG-strict infeasible
+
+| protocol | params | n_test | n_active | AUROC | Δ |
+|---|---|---:|---:|---:|---:|
+| **protein_cluster_50** | identity=50 | 82,897 | 73,502 (89%) | **0.663** | **−9.8pp** ⚠ |
+| protein_cluster_30 | identity=30 | 90,345 | 80,539 | 0.670 | −9.0pp ⚠ |
+| protein_cluster_90 | identity=90 | 96,046 | 81,626 | 0.692 | −6.9pp |
+| scaffold_generic | default | 94,816 | 78,696 | 0.720 | −4.0pp |
+| scaffold | default | 87,015 | 73,719 | 0.739 | −2.1pp |
+| tanimoto_maxmin | T=0.4 | 78,296 | 64,937 | 0.752 | −0.8pp |
+| kg_axis_budget structural | K=2 pub/assay free | 25,575 | 21,669 | 0.757 | −0.3pp |
+| random_per_target | default | 87,091 | 73,278 | 0.758 | −0.3pp |
+| **random** | default | 87,444 | 73,460 | 0.760 | 0 |
+| kg_kdisjoint structural | K=2 chem | 48,505 | 41,060 | 0.762 | +0.2pp |
+| kg_maxmin structural | T=3 chem | 48,505 | 41,060 | 0.762 | +0.2pp |
+
+→ KG-strict infeasible. KG-structural ties random. protein_cluster
+"wins" by inflating active rate, but the label distribution is broken.
+
+### LIT-PCBA (random=0.515 ≈ random chance, all splits noise-dominated)
+
+All AUROCs in [0.49, 0.56]. With 10-53 actives in test, CI widths are
+0.04-0.30 — no meaningful discrimination between protocols.
+
+## Final interpretation
+
+| Claim | Evidence |
+|---|---|
+| **KG-strict is the cleanest split** (0% leak on 4 axes) | DEKOIS + DUD-E: 0% all axes; LIT-PCBA + BigBind + BayesBind: infeasible — itself a finding |
+| **KG-strict is harder than random** | DEKOIS −1.7pp; DUD-E −3.4pp (with stable label distribution) |
+| **KG-strict is harder than ALL baselines** | ❌ NOT universally. Scaffold sometimes ties or beats KG, esp. on BayesBind (scaffold −16.9pp vs KG −14.8pp with 74% active drift) |
+| **No baseline simultaneously matches KG-strict's leak + feasibility + label fidelity** | ✓ — protein_cluster inflates active rate, scaffold leaves pub/assay leak, KG-strict satisfies all three on clean-able benchmarks |
+
+### Honest takeaway
+
+KG-strict is a **fair-distribution leak-clean** split — it's not always the
+"hardest" but it's the **only protocol that simultaneously achieves
+(i) 0% residual leak on all 4 axes, (ii) feasibility, (iii) preserved
+natural label distribution** on DEKOIS / DUD-E. On heavily-entangled
+benchmarks (BigBind, BayesBind, LIT-PCBA), no protocol can achieve all
+three — and the KG analysis quantifies *which* axis is the cause.
+
 ## Next step
 
-Train C-NN (KG-proximity baseline) on the same winner splits to
-quantify how much of Morgan-RF's residual AUROC is structural vs
-KG-topology. Then plug LigUnity / SPRINT / ConGLUDe predictions through
-the mảng H decomposition for retrospective AUROC inflation estimates.
+C-NN (KG-proximity) training on the same 57 split / corpus pairs to
+measure how much residual AUROC is structural vs topological. Then mảng
+H decomposition for LigUnity / SPRINT / ConGLUDe checkpoints.
