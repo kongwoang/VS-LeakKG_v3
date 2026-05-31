@@ -60,8 +60,11 @@ PARAM_SWEEPS: dict[str, list[dict[str, Any]]] = {
         {"K": 2, "axes": "ligand,scaffold,publication,assay"},
     ],
     "kg_maxmin": [
-        {"T": 2, "axes": "ligand,scaffold"},
-        {"T": 2, "axes": "ligand,scaffold,publication,assay"},
+        # T=3 = require min distance ≥ 3 hops (BFS max_hop=2). T=2 is
+        # degenerate — only flips direct train↔test edges, of which
+        # there are none in canonical KG → equivalent to random.
+        {"T": 3, "axes": "ligand,scaffold"},
+        {"T": 3, "axes": "ligand,scaffold,publication,assay"},
     ],
     "kg_axis_budget": [
         # structural-only: relax pub/assay to 100% so they don't constrain
