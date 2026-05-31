@@ -55,8 +55,9 @@ PARAM_SWEEPS: dict[str, list[dict[str, Any]]] = {
     ],
     "datasail": [{}],
     "plinder_style": [
-        {"depth": 1},
-        {"depth": 2},
+        {"depth": 2, "include_protein": False},
+        {"depth": 3, "include_protein": False},
+        {"depth": 2},  # with protein — original PLINDER intent
     ],
     "ave_wallach": [{}],
 }
@@ -148,10 +149,14 @@ def run(args: argparse.Namespace) -> None:
         if rows:
             audit_df = pl.from_dicts(rows)
             audit_path = output_root / "audit_summary.csv"
-            # Append if exists; else write fresh.
             if audit_path.exists():
                 prev = pl.read_csv(audit_path)
                 audit_df = pl.concat([prev, audit_df], how="diagonal_relaxed")
+            # Dedup on (corpus, protocol, params, seed) keeping last.
+            audit_df = audit_df.unique(
+                subset=["corpus", "protocol", "params", "seed"],
+                keep="last",
+            )
             audit_df.write_csv(audit_path)
             print(f"\nwrote {audit_path} ({audit_df.height} rows)")
 

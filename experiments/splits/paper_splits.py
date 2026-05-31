@@ -123,6 +123,7 @@ def build_plinder_style(
     test_ratio: float = 0.15,
     depth: int = 2,
     similarity_threshold: float = 0.5,
+    include_protein: bool = True,
 ) -> SplitResult:
     """PLINDER's `pass_neighbors` heuristic, ported to our KG.
 
@@ -142,12 +143,12 @@ def build_plinder_style(
     differentiator.
     """
     out = stratified_random_assign(examples, test_ratio=test_ratio, seed=seed)
-    # PLINDER-style edges: ligand similarity + protein cluster (structural only)
+    # PLINDER-style edges: ligand similarity + (optionally) protein cluster.
     _, edges = load_canonical_kg(kg_dir)
-    sim_edges = edges.filter(pl.col("edge_type").is_in([
-        "example_has_ligand", "ligand_similar", "ligand_scaffold",
-        "example_has_protein", "protein_in_cluster",
-    ])).select(["src", "dst"])
+    etypes = ["example_has_ligand", "ligand_similar", "ligand_scaffold"]
+    if include_protein:
+        etypes += ["example_has_protein", "protein_in_cluster"]
+    sim_edges = edges.filter(pl.col("edge_type").is_in(etypes)).select(["src", "dst"])
 
     train_ids = out.filter(pl.col("fold") == "train").select("node_id")
     reached = bfs_distance(train_ids, sim_edges, max_hop=depth)
