@@ -40,12 +40,13 @@ PARAM_SWEEPS: dict[str, list[dict[str, Any]]] = {
     "kg_kdisjoint": [
         {"K": 2, "axes": "ligand,scaffold,publication,assay"},
         {"K": 3, "axes": "ligand,scaffold,publication,assay"},
-        {"K": 2},  # all axes incl. protein — likely empty test
+        # all-axes-including-protein dropped: trivially empties test in every
+        # corpus (every example shares a target with some train item), and
+        # the BFS frontier explodes memory on BayesBind/BigBind (OOM kill).
     ],
     "kg_maxmin": [
         {"T": 2, "axes": "ligand,scaffold,publication,assay"},
         {"T": 3, "axes": "ligand,scaffold,publication,assay"},
-        {"T": 2},  # all axes incl. protein
     ],
     "kg_axis_budget": [
         {"K": 2},
