@@ -27,40 +27,48 @@ from .base import build_param_str
 from .factory import build_split, list_protocols
 
 
-# Param sweeps per protocol. Each tuple = a separate run.
+# Param sweeps per protocol. 14-config benchmark:
+#   8 baselines (Nhóm 1 — off-the-shelf, no paper-specific port required)
+#   6 KG (Nhóm 3 — ours, 3 algorithms × 2 axis modes)
+#
+# DataSAIL / PLINDER / AVE (Nhóm 2 — paper baselines) are deliberately
+# excluded: the current ports are simplified fallbacks (datasail is a
+# pure random fallback without mmseqs binaries, plinder_style is a BFS
+# port without the paper's Louvain communities, ave_wallach is a
+# single-pass not the iterative bias optimisation). Including them as
+# headline comparisons would misrepresent prior work.
 PARAM_SWEEPS: dict[str, list[dict[str, Any]]] = {
+    # ---- Nhóm 1 baselines (8 configs) ----
     "random": [{}],
+    "random_per_target": [{}],
     "scaffold": [{}],
-    "tanimoto_maxmin": [{"T": 0.4}],  # single T; canonical sim edges are T≥0.85
+    "scaffold_generic": [{}],
+    "tanimoto_maxmin": [{"T": 0.4}],
     "protein_cluster": [
         {"identity": 30},
         {"identity": 50},
         {"identity": 90},
     ],
+    # ---- Nhóm 3 ours: 3 algorithms × 2 axis modes (6 configs) ----
+    # `structural` axes = ligand + scaffold (chemistry only, what models
+    # actually consume). `strict` axes = + publication + assay (catches
+    # SAR-series leak that scaffold doesn't reach). Both intentionally
+    # exclude direct example_has_protein, which saturates K=2 within
+    # any single-corpus split.
     "kg_kdisjoint": [
+        {"K": 2, "axes": "ligand,scaffold"},
         {"K": 2, "axes": "ligand,scaffold,publication,assay"},
-        {"K": 3, "axes": "ligand,scaffold,publication,assay"},
-        # all-axes-including-protein dropped: trivially empties test in every
-        # corpus (every example shares a target with some train item), and
-        # the BFS frontier explodes memory on BayesBind/BigBind (OOM kill).
     ],
     "kg_maxmin": [
+        {"T": 2, "axes": "ligand,scaffold"},
         {"T": 2, "axes": "ligand,scaffold,publication,assay"},
-        {"T": 3, "axes": "ligand,scaffold,publication,assay"},
     ],
     "kg_axis_budget": [
+        # structural-only: relax pub/assay to 100% so they don't constrain
+        {"K": 2, "budget_publication": 1.0, "budget_assay": 1.0},
+        # strict: chemistry tight AND pub/assay tight
         {"K": 2},
-        {"K": 2, "budget_ligand": 0.01, "budget_publication": 0.01,
-         "budget_assay": 0.01, "budget_scaffold": 0.01,
-         "budget_protein": 0.50},  # strict
     ],
-    "datasail": [{}],
-    "plinder_style": [
-        {"depth": 2, "include_protein": False},
-        {"depth": 3, "include_protein": False},
-        {"depth": 2},  # with protein — original PLINDER intent
-    ],
-    "ave_wallach": [{}],
 }
 
 

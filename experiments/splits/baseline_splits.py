@@ -36,6 +36,126 @@ def build_random(
     return SplitResult(folds=folds, meta={"protocol": "random"})
 
 
+@register_protocol("random_per_target")
+def build_random_per_target(
+    examples: pl.DataFrame,
+    kg_dir: Path,
+    *,
+    seed: int = 42,
+    test_ratio: float = 0.15,
+) -> SplitResult:
+    """Per-target stratified random — the canonical DTI baseline.
+
+    Within each target, label-stratified random split. Preserves label
+    balance per target and prevents accidentally training on more
+    actives from one target than others.
+    """
+    import numpy as np
+    ex_prot = (edges_of_types(["example_has_protein"], kg_dir)
+               .select(["src", "dst"])
+               .rename({"src": "node_id", "dst": "target"})
+               .group_by("node_id")
+               .agg(pl.col("target").first()))
+    enriched = (examples.select(["node_id", "label"])
+                .join(ex_prot, on="node_id", how="left")
+                .with_columns(pl.col("target").fill_null("_no_target")))
+
+    rng = np.random.default_rng(seed)
+    parts = []
+    for grp_keys, g in enriched.group_by(["target", "label"]):
+        n = g.height
+        idx = np.arange(n)
+        rng.shuffle(idx)
+        n_test = int(round(n * test_ratio))
+        fold = np.array(["train"] * n, dtype=object)
+        fold[idx[:n_test]] = "test"
+        parts.append(g.with_columns(pl.Series("fold", fold)))
+    folds = (pl.concat(parts, how="vertical_relaxed")
+             .select(["node_id", "fold"])
+             .with_columns(pl.lit(False).alias("leak_mask")))
+    return SplitResult(folds=folds, meta={"protocol": "random_per_target"})
+
+
+@register_protocol("scaffold_generic")
+def build_scaffold_generic(
+    examples: pl.DataFrame,
+    kg_dir: Path,
+    *,
+    seed: int = 42,
+    test_ratio: float = 0.15,
+) -> SplitResult:
+    """Generic Murcko scaffold (framework only — atom types stripped) split.
+
+    Two Bemis-Murcko scaffolds that look different (e.g. benzofuran vs
+    quinoline) can map to the same generic Murcko framework once you
+    collapse N → C and erase aromaticity tags. Splitting by the generic
+    framework is a coarser, stricter scaffold split — used as a
+    structural baseline alongside Bemis-Murcko.
+
+    Implementation: hash each BM scaffold SMILES by stripping non-ring
+    atom types (a fast proxy for RDKit's MakeScaffoldGeneric). Within
+    each generic class, all examples go to the same fold.
+    """
+    import re
+    import numpy as np
+    lig_scaf = (edges_of_types(["ligand_scaffold"], kg_dir)
+                .select(["src", "dst"])
+                .rename({"src": "lig", "dst": "scaffold"}))
+    ex_lig = (edges_of_types(["example_has_ligand"], kg_dir)
+              .select(["src", "dst"])
+              .rename({"src": "node_id", "dst": "lig"}))
+    ex_scaf = (ex_lig.join(lig_scaf, on="lig", how="left")
+               .group_by("node_id").agg(pl.col("scaffold").first()))
+
+    # Map each Bemis-Murcko scaffold node → generic Murcko framework SMILES
+    # via RDKit's MakeScaffoldGeneric (replaces all heavy atoms with carbon
+    # and erases bond orders). Falls back to the BM scaffold itself when
+    # RDKit can't parse it.
+    from ..common import load_canonical_kg
+    nodes, _ = load_canonical_kg(kg_dir)
+    scaf_nodes = nodes.filter(pl.col("node_type") == "Scaffold").select(
+        ["node_id", "label"]).rename({"node_id": "scaffold", "label": "smi"})
+
+    def _generic(smi: str) -> str:
+        try:
+            from rdkit import Chem
+            from rdkit.Chem.Scaffolds import MurckoScaffold
+            if not smi:
+                return ""
+            mol = Chem.MolFromSmiles(smi)
+            if mol is None:
+                return smi  # fallback
+            generic = MurckoScaffold.MakeScaffoldGeneric(mol)
+            return Chem.MolToSmiles(generic)
+        except Exception:
+            return smi
+
+    # Vectorise via map_elements; cheap because scaffold count is ≤1M.
+    scaf_nodes = scaf_nodes.with_columns(
+        pl.col("smi").map_elements(_generic, return_dtype=pl.Utf8).alias("generic"))
+    ex_scaf = (ex_scaf.join(scaf_nodes.select(["scaffold", "generic"]),
+                             on="scaffold", how="left"))
+    scaffolds = ex_scaf["generic"].drop_nulls().unique().to_list()
+    rng = np.random.default_rng(seed)
+    rng.shuffle(scaffolds)
+    n_test = int(round(len(scaffolds) * test_ratio))
+    test_set = set(scaffolds[:n_test])
+
+    folds = (examples.select("node_id")
+             .join(ex_scaf, on="node_id", how="left")
+             .with_columns(
+                 pl.when(pl.col("generic").is_in(list(test_set)))
+                 .then(pl.lit("test"))
+                 .otherwise(pl.lit("train"))
+                 .alias("fold"))
+             .select(["node_id", "fold"])
+             .with_columns(pl.lit(False).alias("leak_mask")))
+    return SplitResult(folds=folds, meta={
+        "protocol": "scaffold_generic", "n_classes": len(scaffolds),
+        "n_test_classes": n_test,
+    })
+
+
 @register_protocol("scaffold")
 def build_scaffold(
     examples: pl.DataFrame,

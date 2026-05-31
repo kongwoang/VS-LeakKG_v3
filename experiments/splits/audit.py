@@ -11,9 +11,15 @@ from ..common import bfs_distance, edges_of_types, load_canonical_kg
 from .kg_splits import _AXIS_EDGE_SETS
 
 
+# Feasibility: split is usable for AUROC if
+#   (a) total test ≥ 500   (stable bootstrap CI)
+#   (b) ≥ 10 actives       (need positives — works for LIT-PCBA's 0.3% rate)
+#   (c) ≥ 10 decoys        (need negatives)
+# Absolute counts (not %) so corpora with low natural active rate
+# (LIT-PCBA = 0.3%) aren't falsely flagged.
 _FEASIBILITY_MIN_N_TEST = 500
-_FEASIBILITY_MIN_PCT_ACTIVE = 0.005
-_FEASIBILITY_MIN_TARGETS = 3
+_FEASIBILITY_MIN_N_ACTIVE = 10
+_FEASIBILITY_MIN_N_DECOY = 10
 
 
 def audit_split(
@@ -34,8 +40,11 @@ def audit_split(
     test = enriched.filter(pl.col("fold") == "test")
     val = enriched.filter(pl.col("fold") == "val")
 
+    n_test_active = int((test["label"] == 1).sum()) if test.height else 0
+    n_test_decoy = int((test["label"] == 0).sum()) if test.height else 0
     row: dict = {
         "n_train": train.height, "n_val": val.height, "n_test": test.height,
+        "n_test_active": n_test_active, "n_test_decoy": n_test_decoy,
         "pct_active_train": float((train["label"] == 1).mean()) if train.height else None,
         "pct_active_test": float((test["label"] == 1).mean()) if test.height else None,
     }
@@ -62,10 +71,11 @@ def audit_split(
                     .select("prot").unique().height)
     row["n_unique_targets_test"] = test_targets
 
-    # Feasibility flag
+    # Feasibility: enough test items to compute AUROC stably + non-degenerate
+    # label balance (need at least 10 positives and 10 negatives).
     row["feasible"] = (
         test.height >= _FEASIBILITY_MIN_N_TEST
-        and (row["pct_active_test"] or 0) >= _FEASIBILITY_MIN_PCT_ACTIVE
-        and test_targets >= _FEASIBILITY_MIN_TARGETS
+        and n_test_active >= _FEASIBILITY_MIN_N_ACTIVE
+        and n_test_decoy >= _FEASIBILITY_MIN_N_DECOY
     )
     return row
