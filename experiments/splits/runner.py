@@ -144,15 +144,20 @@ def run(args: argparse.Namespace) -> None:
                     audit_rows.append(row)
 
     if audit_rows:
-        # Filter out skipped rows from the summary.
         rows = [r for r in audit_rows if not r.get("skipped")]
         if rows:
+            # Per-corpus audit file to avoid races when multiple sweep
+            # processes run in parallel (one per corpus).
+            if args.audit_suffix:
+                audit_path = output_root / f"audit_summary__{args.audit_suffix}.csv"
+            elif len(corpora) == 1:
+                audit_path = output_root / f"audit_summary__{corpora[0]}.csv"
+            else:
+                audit_path = output_root / "audit_summary.csv"
             audit_df = pl.from_dicts(rows)
-            audit_path = output_root / "audit_summary.csv"
             if audit_path.exists():
                 prev = pl.read_csv(audit_path)
                 audit_df = pl.concat([prev, audit_df], how="diagonal_relaxed")
-            # Dedup on (corpus, protocol, params, seed) keeping last.
             audit_df = audit_df.unique(
                 subset=["corpus", "protocol", "params", "seed"],
                 keep="last",
@@ -170,6 +175,8 @@ def _cli() -> None:
     p.add_argument("--protocols", default="",
                    help="comma-separated; default = all registered")
     p.add_argument("--seeds", default="42,43,44,45,46")
+    p.add_argument("--audit-suffix", default="",
+                   help="override audit filename suffix (else: derived from corpus)")
     args = p.parse_args()
     run(args)
 
